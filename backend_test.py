@@ -225,6 +225,157 @@ class BerachainArbBotAPITester:
         
         return success
 
+    def test_execute_trade_validation(self):
+        """Test execute-trade endpoint input validation"""
+        print("\n🔧 Testing execute-trade endpoint validation...")
+        
+        # Test 1: Invalid pair format
+        invalid_pair_data = {
+            "pair": "INVALID",
+            "buy_dex": "Kodiak V2",
+            "sell_dex": "BEX", 
+            "amount": "100000000000000000000",
+            "slippage": 0.5,
+            "wallet_address": self.mock_wallet
+        }
+        
+        success1, response1 = self.run_test(
+            "Execute Trade - Invalid Pair Format",
+            "POST",
+            "api/execute-trade",
+            400,
+            data=invalid_pair_data
+        )
+        
+        # Test 2: Invalid wallet address
+        invalid_wallet_data = {
+            "pair": "WBERA/HONEY",
+            "buy_dex": "Kodiak V2", 
+            "sell_dex": "BEX",
+            "amount": "100000000000000000000",
+            "slippage": 0.5,
+            "wallet_address": "invalid_address"
+        }
+        
+        success2, response2 = self.run_test(
+            "Execute Trade - Invalid Wallet Address",
+            "POST", 
+            "api/execute-trade",
+            400,
+            data=invalid_wallet_data
+        )
+        
+        # Test 3: Excessive slippage
+        high_slippage_data = {
+            "pair": "WBERA/HONEY",
+            "buy_dex": "Kodiak V2",
+            "sell_dex": "BEX",
+            "amount": "100000000000000000000", 
+            "slippage": 10.0,  # Above MAX_SLIPPAGE_PERCENT (5%)
+            "wallet_address": self.mock_wallet
+        }
+        
+        success3, response3 = self.run_test(
+            "Execute Trade - Excessive Slippage",
+            "POST",
+            "api/execute-trade", 
+            200,  # Should return 200 but with success=false
+            data=high_slippage_data
+        )
+        
+        if success3 and not response3.get('success', True):
+            print(f"   ✅ Correctly rejected high slippage: {response3.get('error', '')}")
+        
+        return success1 and success2 and success3
+
+    def test_execute_trade_safety_checks(self):
+        """Test execute-trade endpoint safety checks"""
+        print("\n🛡️ Testing execute-trade safety checks...")
+        
+        # Test 1: Trade size limit
+        large_trade_data = {
+            "pair": "WBERA/HONEY",
+            "buy_dex": "Kodiak V2",
+            "sell_dex": "BEX",
+            "amount": "10000000000000000000000",  # Very large amount 
+            "slippage": 0.5,
+            "wallet_address": self.mock_wallet
+        }
+        
+        success1, response1 = self.run_test(
+            "Execute Trade - Large Trade Size Safety Check",
+            "POST",
+            "api/execute-trade",
+            200,
+            data=large_trade_data
+        )
+        
+        if success1:
+            if not response1.get('success', True):
+                print(f"   ✅ Safety check passed: {response1.get('error', '')}")
+            else:
+                print(f"   ⚠️ Large trade was allowed: {response1}")
+        
+        # Test 2: Valid trade request (should pass all checks)
+        valid_trade_data = {
+            "pair": "WBERA/HONEY",
+            "buy_dex": "Kodiak V2", 
+            "sell_dex": "BEX",
+            "amount": "100000000000000000000",  # 100 WBERA
+            "slippage": 0.5,
+            "wallet_address": self.mock_wallet
+        }
+        
+        success2, response2 = self.run_test(
+            "Execute Trade - Valid Request Structure",
+            "POST",
+            "api/execute-trade",
+            200,
+            data=valid_trade_data
+        )
+        
+        if success2:
+            print(f"   Response keys: {list(response2.keys())}")
+            
+            # Check required response fields
+            required_fields = ['success', 'execution_id']
+            for field in required_fields:
+                if field in response2:
+                    print(f"   ✅ Has {field}: {response2[field]}")
+                else:
+                    print(f"   ❌ Missing {field}")
+            
+            # If trade verification passed, check profit calculations
+            if response2.get('success', False):
+                verification = response2.get('verification', {})
+                if verification:
+                    print(f"   Net Profit: ${verification.get('net_profit_usd', 0):.4f}")
+                    print(f"   Gas Cost: ${verification.get('gas_cost_usd', 0):.4f}")
+                    print(f"   Raw Profit: ${verification.get('raw_profit_usd', 0):.4f}")
+                    print(f"   Spread: {verification.get('spread_percent', 0):.3f}%")
+            else:
+                print(f"   Trade rejected: {response2.get('error', 'Unknown reason')}")
+        
+        return success1 and success2
+
+    def test_quote_endpoint(self):
+        """Test quote endpoint for price fetching"""
+        success, response = self.run_test(
+            "DEX Quote Endpoint",
+            "GET",
+            "api/quote?token_in=0x6969696969696969696969696969696969696969&token_out=0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce&amount_in=100000000000000000000&dex=kodiak",
+            200
+        )
+        
+        if success:
+            print(f"   DEX: {response.get('dex', 'N/A')}")
+            print(f"   Token In: {response.get('token_in', 'N/A')}")
+            print(f"   Token Out: {response.get('token_out', 'N/A')}")
+            print(f"   Price: {response.get('price', 0)}")
+            print(f"   Amount Out: {response.get('amount_out', 'N/A')}")
+        
+        return success
+
 def main():
     print("🚀 Starting BeraArb API Testing...")
     print("=" * 60)
@@ -241,6 +392,9 @@ def main():
         tester.test_wallet_balances_endpoint,
         tester.test_analytics_endpoint,
         tester.test_settings_endpoints,
+        tester.test_quote_endpoint,
+        tester.test_execute_trade_validation,
+        tester.test_execute_trade_safety_checks,
     ]
     
     # Run all tests

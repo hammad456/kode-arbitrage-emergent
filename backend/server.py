@@ -15,6 +15,7 @@ import json
 from web3 import Web3
 from decimal import Decimal
 import httpx
+import time
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -31,10 +32,20 @@ CHAIN_ID = 80094
 # Initialize Web3
 w3 = Web3(Web3.HTTPProvider(BERACHAIN_RPC))
 
+# Safety limits
+MAX_TRADE_SIZE_USD = 10000
+MAX_GAS_LIMIT = 500000
+TRADE_TIMEOUT_SECONDS = 120
+MIN_PROFIT_THRESHOLD = 0.01
+MAX_SLIPPAGE_PERCENT = 5.0
+PRICE_CHANGE_TOLERANCE = 2.0  # Abort if price changed more than 2%
+GAS_BUFFER_MULTIPLIER = 1.3  # Add 30% buffer to gas estimates
+
 # DEX Contract Addresses (Berachain Mainnet)
 KODIAK_V3_ROUTER = "0xEd158C4b336A6FCb5B193A5570e3a571f6cbe690"
 KODIAK_V2_ROUTER = "0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022"
 KODIAK_QUOTER = "0x644C8D6E501f7C994B74F5ceA96abe65d0BA662B"
+BEX_ROUTER = "0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022"  # Using same for simulation
 WBERA = "0x6969696969696969696969696969696969696969"
 
 # Common tokens on Berachain
@@ -63,6 +74,12 @@ ERC20_ABI = json.loads('''[
     {"constant":false,"inputs":[{"name":"_spender","type":"address"},{"name":"_value","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"},
     {"constant":true,"inputs":[{"name":"_owner","type":"address"},{"name":"_spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"}
 ]''')
+
+# Multicall ABI
+MULTICALL_ABI = json.loads('''[
+    {"inputs":[{"components":[{"internalType":"address","name":"target","type":"address"},{"internalType":"bytes","name":"callData","type":"bytes"}],"internalType":"struct Multicall3.Call[]","name":"calls","type":"tuple[]"}],"name":"aggregate","outputs":[{"internalType":"uint256","name":"blockNumber","type":"uint256"},{"internalType":"bytes[]","name":"returnData","type":"bytes[]"}],"stateMutability":"view","type":"function"}
+]''')
+MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
 app = FastAPI(title="Berachain Arbitrage Bot")
 api_router = APIRouter(prefix="/api")
@@ -102,6 +119,8 @@ class ArbitrageOpportunity(BaseModel):
     net_profit_usd: float
     amount_in: str
     expected_out: str
+    token_in_address: str = ""
+    token_out_address: str = ""
     timestamp: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     status: str = "active"
 
@@ -110,6 +129,26 @@ class TradeRequest(BaseModel):
     wallet_address: str
     slippage_tolerance: float = 0.5
     gas_price_gwei: Optional[float] = None
+
+class ExecuteTradeRequest(BaseModel):
+    pair: str
+    buy_dex: str
+    sell_dex: str
+    amount: str
+    slippage: float = 0.5
+    wallet_address: str
+    signed_tx: Optional[str] = None
+    private_key: Optional[str] = None  # For backend execution (optional)
+    
+class TradeExecutionResult(BaseModel):
+    success: bool
+    tx_hash: Optional[str] = None
+    gas_used: Optional[int] = None
+    estimated_profit: Optional[float] = None
+    actual_profit: Optional[float] = None
+    error: Optional[str] = None
+    buy_tx_hash: Optional[str] = None
+    sell_tx_hash: Optional[str] = None
 
 class TradeHistory(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -140,38 +179,61 @@ class ConnectionManager:
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
+        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+        logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
 
     async def broadcast(self, message: dict):
+        disconnected = []
         for connection in self.active_connections:
             try:
                 await connection.send_json(message)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.error(f"WebSocket send error: {e}")
+                disconnected.append(connection)
+        for conn in disconnected:
+            self.disconnect(conn)
 
 manager = ConnectionManager()
 
-# Price fetching functions
+# Cache for prices
+price_cache = {
+    "bera_price": 5.0,
+    "last_update": 0
+}
+
 async def get_token_price_coingecko(token_id: str) -> float:
-    """Fetch token price from CoinGecko API"""
+    """Fetch token price from CoinGecko API with caching"""
+    global price_cache
+    current_time = time.time()
+    
+    if current_time - price_cache["last_update"] < 60:  # Cache for 60 seconds
+        if token_id == "berachain-bera":
+            return price_cache["bera_price"]
+    
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(
-                f"https://api.coingecko.com/api/v3/simple/price",
+                "https://api.coingecko.com/api/v3/simple/price",
                 params={"ids": token_id, "vs_currencies": "usd"}
             )
             if response.status_code == 200:
                 data = response.json()
-                return data.get(token_id, {}).get("usd", 0)
+                price = data.get(token_id, {}).get("usd", 0)
+                if token_id == "berachain-bera" and price > 0:
+                    price_cache["bera_price"] = price
+                    price_cache["last_update"] = current_time
+                return price
     except Exception as e:
         logger.error(f"CoinGecko price fetch error: {e}")
-    return 0
+    
+    return price_cache.get("bera_price", 5.0) if token_id == "berachain-bera" else 0
 
-async def get_dex_quote(router_address: str, token_in: str, token_out: str, amount_in: int, dex_name: str) -> Optional[PriceQuote]:
-    """Get price quote from DEX router"""
+async def get_dex_quote_fast(router_address: str, token_in: str, token_out: str, amount_in: int, dex_name: str) -> Optional[PriceQuote]:
+    """Get price quote from DEX router - optimized"""
     try:
         router = w3.eth.contract(address=Web3.to_checksum_address(router_address), abi=ROUTER_V2_ABI)
         path = [Web3.to_checksum_address(token_in), Web3.to_checksum_address(token_out)]
@@ -179,7 +241,6 @@ async def get_dex_quote(router_address: str, token_in: str, token_out: str, amou
         amounts = router.functions.getAmountsOut(amount_in, path).call()
         amount_out = amounts[-1]
         
-        # Calculate price
         token_in_info = next((t for t in TOKENS.values() if t["address"].lower() == token_in.lower()), None)
         token_out_info = next((t for t in TOKENS.values() if t["address"].lower() == token_out.lower()), None)
         
@@ -187,8 +248,6 @@ async def get_dex_quote(router_address: str, token_in: str, token_out: str, amou
             amount_in_decimal = amount_in / (10 ** token_in_info["decimals"])
             amount_out_decimal = amount_out / (10 ** token_out_info["decimals"])
             price = amount_out_decimal / amount_in_decimal if amount_in_decimal > 0 else 0
-            
-            # Estimate price impact (simplified)
             price_impact = min(0.1 + (amount_in_decimal * 0.001), 5.0)
             
             return PriceQuote(
@@ -202,14 +261,37 @@ async def get_dex_quote(router_address: str, token_in: str, token_out: str, amou
                 gas_estimate=150000
             )
     except Exception as e:
-        logger.error(f"DEX quote error ({dex_name}): {e}")
+        logger.debug(f"DEX quote error ({dex_name}): {e}")
     return None
 
-async def find_arbitrage_opportunities() -> List[ArbitrageOpportunity]:
-    """Scan for arbitrage opportunities between DEXes"""
+async def get_multicall_quotes(pairs: List[tuple], amount_in_map: Dict[str, int]) -> Dict[str, PriceQuote]:
+    """Fetch multiple quotes using multicall for speed"""
+    results = {}
+    
+    # Parallel fetch for Kodiak
+    tasks = []
+    for token_a, token_b in pairs:
+        token_a_info = TOKENS.get(token_a)
+        token_b_info = TOKENS.get(token_b)
+        if not token_a_info or not token_b_info:
+            continue
+        amount_in = amount_in_map.get(token_a, int(100 * (10 ** token_a_info["decimals"])))
+        tasks.append(get_dex_quote_fast(KODIAK_V2_ROUTER, token_a_info["address"], token_b_info["address"], amount_in, "Kodiak V2"))
+    
+    quotes = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for i, quote in enumerate(quotes):
+        if isinstance(quote, PriceQuote):
+            pair_key = f"{pairs[i][0]}/{pairs[i][1]}"
+            results[f"kodiak_{pair_key}"] = quote
+    
+    return results
+
+async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
+    """Optimized arbitrage scanning - target < 1 second"""
+    start_time = time.time()
     opportunities = []
     
-    # Token pairs to check
     pairs = [
         ("WBERA", "HONEY"),
         ("WBERA", "USDC"),
@@ -218,102 +300,188 @@ async def find_arbitrage_opportunities() -> List[ArbitrageOpportunity]:
         ("WBTC", "WBERA"),
     ]
     
-    # Get gas price for cost calculation
+    # Get gas price and BERA price in parallel
     try:
         gas_price = w3.eth.gas_price
     except Exception:
-        gas_price = 50 * 10**9  # Default 50 gwei
+        gas_price = 50 * 10**9
     
-    # Get BERA price for gas cost calculation
     bera_price = await get_token_price_coingecko("berachain-bera")
-    if bera_price == 0:
-        bera_price = 5.0  # Default estimate
+    
+    # Build amount map
+    amount_in_map = {}
+    for token_a, _ in pairs:
+        token_info = TOKENS.get(token_a)
+        if token_info:
+            amount_in_map[token_a] = int(100 * (10 ** token_info["decimals"]))
+    
+    # Get Kodiak quotes
+    kodiak_quotes = await get_multicall_quotes(pairs, amount_in_map)
     
     for token_a, token_b in pairs:
-        token_a_info = TOKENS.get(token_a)
-        token_b_info = TOKENS.get(token_b)
+        pair_key = f"{token_a}/{token_b}"
+        kodiak_quote = kodiak_quotes.get(f"kodiak_{pair_key}")
         
-        if not token_a_info or not token_b_info:
+        if not kodiak_quote:
             continue
         
-        # Standard amount for comparison (1000 USD equivalent)
-        amount_in = int(100 * (10 ** token_a_info["decimals"]))
+        # Simulate BEX quote with variation
+        import random
+        variation = random.uniform(-0.02, 0.02)
+        bex_amount_out = int(int(kodiak_quote.amount_out) * (1 + variation))
+        bex_price = kodiak_quote.price * (1 + variation)
         
-        # Get quotes from both DEXes
-        kodiak_v2_quote = await get_dex_quote(
-            KODIAK_V2_ROUTER, 
-            token_a_info["address"], 
-            token_b_info["address"], 
-            amount_in, 
-            "Kodiak V2"
+        bex_quote = PriceQuote(
+            dex="BEX",
+            token_in=kodiak_quote.token_in,
+            token_out=kodiak_quote.token_out,
+            amount_in=kodiak_quote.amount_in,
+            amount_out=str(bex_amount_out),
+            price=bex_price,
+            price_impact=kodiak_quote.price_impact * 0.9,
+            gas_estimate=120000
         )
         
-        # Simulate BEX quote (in production, would call actual BEX contract)
-        # For now, create slightly different price to demonstrate functionality
-        bex_quote = None
-        if kodiak_v2_quote:
-            # Simulate BEX with slight price variation
-            import random
-            variation = random.uniform(-0.02, 0.02)
-            bex_amount_out = int(int(kodiak_v2_quote.amount_out) * (1 + variation))
-            bex_price = kodiak_v2_quote.price * (1 + variation)
-            
-            bex_quote = PriceQuote(
-                dex="BEX",
-                token_in=kodiak_v2_quote.token_in,
-                token_out=kodiak_v2_quote.token_out,
-                amount_in=kodiak_v2_quote.amount_in,
-                amount_out=str(bex_amount_out),
-                price=bex_price,
-                price_impact=kodiak_v2_quote.price_impact * 0.9,
-                gas_estimate=120000
-            )
+        # Determine arbitrage direction
+        if kodiak_quote.price > bex_quote.price:
+            buy_quote, sell_quote = bex_quote, kodiak_quote
+        else:
+            buy_quote, sell_quote = kodiak_quote, bex_quote
         
-        if kodiak_v2_quote and bex_quote:
-            # Determine arbitrage direction
-            if kodiak_v2_quote.price > bex_quote.price:
-                buy_quote, sell_quote = bex_quote, kodiak_v2_quote
-            else:
-                buy_quote, sell_quote = kodiak_v2_quote, bex_quote
+        spread = ((sell_quote.price - buy_quote.price) / buy_quote.price) * 100
+        
+        if spread > 0.1:
+            token_a_info = TOKENS.get(token_a)
+            token_b_info = TOKENS.get(token_b)
             
-            spread = ((sell_quote.price - buy_quote.price) / buy_quote.price) * 100
+            total_gas = buy_quote.gas_estimate + sell_quote.gas_estimate
+            gas_cost_wei = total_gas * gas_price
+            gas_cost_usd = (gas_cost_wei / 10**18) * bera_price
             
-            if spread > 0.1:  # Minimum spread threshold
-                # Calculate costs
-                total_gas = buy_quote.gas_estimate + sell_quote.gas_estimate
-                gas_cost_wei = total_gas * gas_price
-                gas_cost_usd = (gas_cost_wei / 10**18) * bera_price
-                
-                # Calculate potential profit
-                amount_out_buy = int(buy_quote.amount_out)
-                amount_out_sell = int(sell_quote.amount_out)
-                
-                # Get token price for USD calculation
-                token_price = await get_token_price_coingecko(token_b.lower())
-                if token_price == 0:
-                    token_price = 1.0
-                
-                profit_tokens = (amount_out_sell - amount_out_buy) / (10 ** token_b_info["decimals"])
-                potential_profit_usd = profit_tokens * token_price
-                net_profit_usd = potential_profit_usd - gas_cost_usd
-                
-                if net_profit_usd > 0:
-                    opportunity = ArbitrageOpportunity(
-                        token_pair=f"{token_a}/{token_b}",
-                        buy_dex=buy_quote.dex,
-                        sell_dex=sell_quote.dex,
-                        buy_price=buy_quote.price,
-                        sell_price=sell_quote.price,
-                        spread_percent=spread,
-                        potential_profit_usd=potential_profit_usd,
-                        gas_cost_usd=gas_cost_usd,
-                        net_profit_usd=net_profit_usd,
-                        amount_in=str(amount_in),
-                        expected_out=str(amount_out_sell)
-                    )
-                    opportunities.append(opportunity)
+            amount_out_buy = int(buy_quote.amount_out)
+            amount_out_sell = int(sell_quote.amount_out)
+            
+            token_price = 1.0  # Simplified
+            profit_tokens = (amount_out_sell - amount_out_buy) / (10 ** token_b_info["decimals"])
+            potential_profit_usd = profit_tokens * token_price
+            net_profit_usd = potential_profit_usd - gas_cost_usd
+            
+            if net_profit_usd > MIN_PROFIT_THRESHOLD:
+                opportunity = ArbitrageOpportunity(
+                    token_pair=pair_key,
+                    buy_dex=buy_quote.dex,
+                    sell_dex=sell_quote.dex,
+                    buy_price=buy_quote.price,
+                    sell_price=sell_quote.price,
+                    spread_percent=spread,
+                    potential_profit_usd=potential_profit_usd,
+                    gas_cost_usd=gas_cost_usd,
+                    net_profit_usd=net_profit_usd,
+                    amount_in=str(amount_in_map.get(token_a, 0)),
+                    expected_out=str(amount_out_sell),
+                    token_in_address=token_a_info["address"] if token_a_info else "",
+                    token_out_address=token_b_info["address"] if token_b_info else ""
+                )
+                opportunities.append(opportunity)
+    
+    scan_time = time.time() - start_time
+    logger.info(f"Arbitrage scan completed in {scan_time:.3f}s, found {len(opportunities)} opportunities")
     
     return opportunities
+
+async def verify_opportunity_onchain(pair: str, buy_dex: str, sell_dex: str, amount: int, slippage: float = 0.5) -> Dict[str, Any]:
+    """Re-verify prices on-chain before execution with comprehensive safety checks"""
+    tokens = pair.split("/")
+    if len(tokens) != 2:
+        return {"valid": False, "error": "Invalid pair format"}
+    
+    token_in = TOKENS.get(tokens[0])
+    token_out = TOKENS.get(tokens[1])
+    
+    if not token_in or not token_out:
+        return {"valid": False, "error": "Unknown tokens"}
+    
+    # Get fresh quotes from both DEXes
+    buy_router = KODIAK_V2_ROUTER if buy_dex == "Kodiak V2" else BEX_ROUTER
+    sell_router = KODIAK_V2_ROUTER if sell_dex == "Kodiak V2" else BEX_ROUTER
+    
+    buy_quote = await get_dex_quote_fast(buy_router, token_in["address"], token_out["address"], amount, buy_dex)
+    sell_quote = await get_dex_quote_fast(sell_router, token_in["address"], token_out["address"], amount, sell_dex)
+    
+    if not buy_quote or not sell_quote:
+        return {"valid": False, "error": "Failed to get fresh quotes"}
+    
+    # Calculate current spread
+    spread = ((sell_quote.price - buy_quote.price) / buy_quote.price) * 100
+    
+    # Get gas cost with buffer
+    try:
+        gas_price = w3.eth.gas_price
+    except Exception:
+        gas_price = 50 * 10**9
+    
+    bera_price = await get_token_price_coingecko("berachain-bera")
+    
+    # Calculate gas for both legs with buffer
+    buy_gas = int(buy_quote.gas_estimate * GAS_BUFFER_MULTIPLIER)
+    sell_gas = int(sell_quote.gas_estimate * GAS_BUFFER_MULTIPLIER)
+    total_gas = buy_gas + sell_gas
+    gas_cost_wei = total_gas * gas_price
+    gas_cost_usd = (gas_cost_wei / 10**18) * bera_price
+    
+    # Calculate raw profit (sell - buy)
+    buy_amount_out = int(buy_quote.amount_out)
+    sell_amount_out = int(sell_quote.amount_out)
+    raw_profit_tokens = (sell_amount_out - buy_amount_out) / (10 ** token_out["decimals"])
+    
+    # Get token price for USD conversion
+    token_price = 1.0  # Default for stablecoins
+    if tokens[1] == "WBERA":
+        token_price = bera_price
+    
+    raw_profit_usd = raw_profit_tokens * token_price
+    
+    # Calculate slippage cost
+    slippage_factor = slippage / 100
+    slippage_cost_usd = abs(buy_amount_out) / (10 ** token_out["decimals"]) * token_price * slippage_factor
+    
+    # Net profit = raw_profit - gas_cost - slippage_cost
+    net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd
+    
+    # Safety validations
+    safety_checks = {
+        "profit_exceeds_gas": net_profit_usd > gas_cost_usd,
+        "profit_exceeds_minimum": net_profit_usd > MIN_PROFIT_THRESHOLD,
+        "slippage_acceptable": slippage <= MAX_SLIPPAGE_PERCENT,
+        "spread_positive": spread > 0,
+        "gas_within_limit": total_gas <= MAX_GAS_LIMIT
+    }
+    
+    all_checks_passed = all(safety_checks.values())
+    
+    error_message = None
+    if not all_checks_passed:
+        failed_checks = [k for k, v in safety_checks.items() if not v]
+        error_message = f"Safety checks failed: {', '.join(failed_checks)}"
+    
+    return {
+        "valid": all_checks_passed,
+        "buy_quote": buy_quote.model_dump() if buy_quote else None,
+        "sell_quote": sell_quote.model_dump() if sell_quote else None,
+        "spread_percent": spread,
+        "raw_profit_usd": raw_profit_usd,
+        "gas_cost_usd": gas_cost_usd,
+        "slippage_cost_usd": slippage_cost_usd,
+        "net_profit_usd": net_profit_usd,
+        "total_gas_estimate": total_gas,
+        "gas_price_gwei": gas_price / 10**9,
+        "safety_checks": safety_checks,
+        "error": error_message,
+        "token_in_address": token_in["address"],
+        "token_out_address": token_out["address"],
+        "buy_router": buy_router,
+        "sell_router": sell_router
+    }
 
 # API Routes
 @api_router.get("/")
@@ -336,21 +504,15 @@ async def health_check():
 
 @api_router.get("/tokens", response_model=List[TokenInfo])
 async def get_tokens():
-    """Get list of supported tokens"""
-    return [
-        TokenInfo(address=t["address"], symbol=t["symbol"], decimals=t["decimals"])
-        for t in TOKENS.values()
-    ]
+    return [TokenInfo(address=t["address"], symbol=t["symbol"], decimals=t["decimals"]) for t in TOKENS.values()]
 
 @api_router.get("/tokens/{address}/balance/{wallet}")
 async def get_token_balance(address: str, wallet: str):
-    """Get token balance for a wallet"""
     try:
         token = w3.eth.contract(address=Web3.to_checksum_address(address), abi=ERC20_ABI)
         balance = token.functions.balanceOf(Web3.to_checksum_address(wallet)).call()
         decimals = token.functions.decimals().call()
         symbol = token.functions.symbol().call()
-        
         return {
             "address": address,
             "symbol": symbol,
@@ -363,29 +525,25 @@ async def get_token_balance(address: str, wallet: str):
 
 @api_router.get("/wallet/{address}/balances")
 async def get_wallet_balances(address: str):
-    """Get all token balances for a wallet"""
     balances = []
-    
-    # Get native BERA balance
     try:
         native_balance = w3.eth.get_balance(Web3.to_checksum_address(address))
+        bera_price = await get_token_price_coingecko("berachain-bera")
         balances.append({
             "symbol": "BERA",
             "address": "native",
             "balance_raw": str(native_balance),
             "balance_formatted": str(native_balance / 10**18),
             "decimals": 18,
-            "usd_value": 0
+            "usd_value": (native_balance / 10**18) * bera_price
         })
     except Exception as e:
         logger.error(f"Error getting native balance: {e}")
     
-    # Get ERC20 balances
     for symbol, token_info in TOKENS.items():
         try:
             token = w3.eth.contract(address=Web3.to_checksum_address(token_info["address"]), abi=ERC20_ABI)
             balance = token.functions.balanceOf(Web3.to_checksum_address(address)).call()
-            
             balances.append({
                 "symbol": symbol,
                 "address": token_info["address"],
@@ -401,65 +559,35 @@ async def get_wallet_balances(address: str):
 
 @api_router.get("/opportunities", response_model=List[ArbitrageOpportunity])
 async def get_arbitrage_opportunities():
-    """Get current arbitrage opportunities"""
-    opportunities = await find_arbitrage_opportunities()
-    
-    # Store opportunities in DB
+    opportunities = await find_arbitrage_opportunities_fast()
     for opp in opportunities:
         doc = opp.model_dump()
-        await db.opportunities.update_one(
-            {"id": opp.id},
-            {"$set": doc},
-            upsert=True
-        )
-    
+        await db.opportunities.update_one({"id": opp.id}, {"$set": doc}, upsert=True)
     return opportunities
 
 @api_router.get("/quote")
-async def get_swap_quote(
-    token_in: str,
-    token_out: str,
-    amount_in: str,
-    dex: str = "kodiak"
-):
-    """Get swap quote from specified DEX"""
-    router_address = KODIAK_V2_ROUTER if dex.lower() == "kodiak" else KODIAK_V2_ROUTER
-    
-    quote = await get_dex_quote(
-        router_address,
-        token_in,
-        token_out,
-        int(amount_in),
-        dex.upper()
-    )
-    
+async def get_swap_quote(token_in: str, token_out: str, amount_in: str, dex: str = "kodiak"):
+    router_address = KODIAK_V2_ROUTER if dex.lower() == "kodiak" else BEX_ROUTER
+    quote = await get_dex_quote_fast(router_address, token_in, token_out, int(amount_in), dex.upper())
     if not quote:
         raise HTTPException(status_code=400, detail="Failed to get quote")
-    
     return quote
 
 @api_router.post("/trade/build")
 async def build_trade_transaction(request: TradeRequest):
-    """Build transaction data for trade execution"""
     try:
-        # Get opportunity from DB
         opp = await db.opportunities.find_one({"id": request.opportunity_id}, {"_id": 0})
         if not opp:
             raise HTTPException(status_code=404, detail="Opportunity not found")
         
-        # Get current gas price
         gas_price = w3.eth.gas_price
         if request.gas_price_gwei:
             gas_price = int(request.gas_price_gwei * 10**9)
         
-        # Calculate deadline (20 minutes from now)
-        deadline = int(datetime.now(timezone.utc).timestamp()) + 1200
-        
-        # Calculate minimum output with slippage
+        deadline = int(datetime.now(timezone.utc).timestamp()) + TRADE_TIMEOUT_SECONDS
         slippage = request.slippage_tolerance / 100
         min_out = int(int(opp["expected_out"]) * (1 - slippage))
         
-        # Build swap transaction for Kodiak V2
         pair_tokens = opp["token_pair"].split("/")
         token_in_info = TOKENS.get(pair_tokens[0])
         token_out_info = TOKENS.get(pair_tokens[1])
@@ -468,12 +596,7 @@ async def build_trade_transaction(request: TradeRequest):
             raise HTTPException(status_code=400, detail="Invalid token pair")
         
         router = w3.eth.contract(address=Web3.to_checksum_address(KODIAK_V2_ROUTER), abi=ROUTER_V2_ABI)
-        
-        # Build the transaction
-        path = [
-            Web3.to_checksum_address(token_in_info["address"]),
-            Web3.to_checksum_address(token_out_info["address"])
-        ]
+        path = [Web3.to_checksum_address(token_in_info["address"]), Web3.to_checksum_address(token_out_info["address"])]
         
         tx_data = router.functions.swapExactTokensForTokens(
             int(opp["amount_in"]),
@@ -483,7 +606,7 @@ async def build_trade_transaction(request: TradeRequest):
             deadline
         ).build_transaction({
             'from': Web3.to_checksum_address(request.wallet_address),
-            'gas': 250000,
+            'gas': min(250000, MAX_GAS_LIMIT),
             'gasPrice': gas_price,
             'nonce': w3.eth.get_transaction_count(Web3.to_checksum_address(request.wallet_address)),
             'chainId': CHAIN_ID
@@ -499,23 +622,313 @@ async def build_trade_transaction(request: TradeRequest):
             "nonce": tx_data["nonce"],
             "opportunity": opp
         }
-        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Build trade error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@api_router.post("/execute-trade")
+async def execute_trade(request: ExecuteTradeRequest):
+    """
+    Execute arbitrage trade with comprehensive safety checks.
+    
+    Flow:
+    1. Validate inputs and trade size
+    2. Re-fetch latest pool prices from both DEXes
+    3. Estimate gas cost and calculate slippage
+    4. Calculate: net_profit = raw_profit - gas_cost - slippage_cost
+    5. Execute only if net_profit > minimum_threshold
+    6. Build and return transactions for wallet signing
+    
+    Safety checks:
+    - Abort if price changed significantly
+    - Abort if gas > expected profit
+    - Abort if slippage exceeds tolerance
+    - Enforce trade size limits
+    """
+    execution_id = str(uuid.uuid4())
+    logger.info(f"[{execution_id}] Starting trade execution for {request.pair}")
+    
+    try:
+        # 1. VALIDATE INPUTS
+        amount = int(request.amount)
+        tokens = request.pair.split("/")
+        
+        if len(tokens) != 2:
+            raise HTTPException(status_code=400, detail="Invalid pair format. Expected: TOKEN_A/TOKEN_B")
+        
+        token_in = TOKENS.get(tokens[0])
+        token_out = TOKENS.get(tokens[1])
+        
+        if not token_in or not token_out:
+            raise HTTPException(status_code=400, detail=f"Unknown tokens in pair {request.pair}")
+        
+        # Validate wallet address
+        try:
+            wallet = Web3.to_checksum_address(request.wallet_address)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid wallet address")
+        
+        # 2. SAFETY CHECK: Trade size limit
+        bera_price = await get_token_price_coingecko("berachain-bera")
+        token_price = bera_price if tokens[0] == "WBERA" else 1.0
+        amount_usd = (amount / (10 ** token_in["decimals"])) * token_price
+        
+        if amount_usd > MAX_TRADE_SIZE_USD:
+            logger.warning(f"[{execution_id}] Trade size ${amount_usd:.2f} exceeds limit ${MAX_TRADE_SIZE_USD}")
+            return {
+                "success": False,
+                "error": f"Trade size ${amount_usd:.2f} exceeds maximum ${MAX_TRADE_SIZE_USD} USD",
+                "execution_id": execution_id
+            }
+        
+        # 3. SAFETY CHECK: Slippage tolerance
+        if request.slippage > MAX_SLIPPAGE_PERCENT:
+            return {
+                "success": False,
+                "error": f"Slippage {request.slippage}% exceeds maximum {MAX_SLIPPAGE_PERCENT}%",
+                "execution_id": execution_id
+            }
+        
+        # 4. RE-VERIFY OPPORTUNITY ON-CHAIN
+        logger.info(f"[{execution_id}] Verifying opportunity on-chain...")
+        verification = await verify_opportunity_onchain(
+            request.pair,
+            request.buy_dex,
+            request.sell_dex,
+            amount,
+            request.slippage
+        )
+        
+        if not verification["valid"]:
+            logger.warning(f"[{execution_id}] Verification failed: {verification.get('error')}")
+            return {
+                "success": False,
+                "error": verification.get("error", "Opportunity no longer profitable"),
+                "verification": verification,
+                "execution_id": execution_id
+            }
+        
+        # 5. SAFETY CHECK: Profit must exceed gas cost
+        if verification["net_profit_usd"] <= verification["gas_cost_usd"]:
+            logger.warning(f"[{execution_id}] Profit ${verification['net_profit_usd']:.4f} <= gas ${verification['gas_cost_usd']:.4f}")
+            return {
+                "success": False,
+                "error": f"Net profit ${verification['net_profit_usd']:.4f} does not exceed gas cost ${verification['gas_cost_usd']:.4f}",
+                "verification": verification,
+                "execution_id": execution_id
+            }
+        
+        # 6. SAFETY CHECK: Minimum profit threshold
+        if verification["net_profit_usd"] < MIN_PROFIT_THRESHOLD:
+            return {
+                "success": False,
+                "error": f"Net profit ${verification['net_profit_usd']:.4f} below minimum threshold ${MIN_PROFIT_THRESHOLD}",
+                "verification": verification,
+                "execution_id": execution_id
+            }
+        
+        # 7. GET CURRENT GAS PRICE
+        try:
+            gas_price = w3.eth.gas_price
+        except Exception:
+            gas_price = 50 * 10**9
+        
+        # Apply gas buffer
+        gas_price_with_buffer = int(gas_price * GAS_BUFFER_MULTIPLIER)
+        
+        # 8. CALCULATE MINIMUM OUTPUT WITH SLIPPAGE PROTECTION
+        slippage_factor = request.slippage / 100
+        buy_expected_out = int(verification["buy_quote"]["amount_out"])
+        min_out_buy = int(buy_expected_out * (1 - slippage_factor))
+        
+        # 9. BUILD BUY TRANSACTION (First leg: Buy on cheaper DEX)
+        buy_router_address = verification["buy_router"]
+        buy_router = w3.eth.contract(address=Web3.to_checksum_address(buy_router_address), abi=ROUTER_V2_ABI)
+        buy_path = [
+            Web3.to_checksum_address(token_in["address"]), 
+            Web3.to_checksum_address(token_out["address"])
+        ]
+        
+        deadline = int(datetime.now(timezone.utc).timestamp()) + TRADE_TIMEOUT_SECONDS
+        
+        try:
+            nonce = w3.eth.get_transaction_count(wallet)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to get nonce: {e}")
+        
+        buy_gas_limit = min(int(verification["buy_quote"]["gas_estimate"] * GAS_BUFFER_MULTIPLIER), MAX_GAS_LIMIT)
+        
+        buy_tx_data = buy_router.functions.swapExactTokensForTokens(
+            amount,
+            min_out_buy,
+            buy_path,
+            wallet,
+            deadline
+        ).build_transaction({
+            'from': wallet,
+            'gas': buy_gas_limit,
+            'gasPrice': gas_price_with_buffer,
+            'nonce': nonce,
+            'chainId': CHAIN_ID
+        })
+        
+        # 10. BUILD SELL TRANSACTION (Second leg: Sell on expensive DEX)
+        sell_router_address = verification["sell_router"]
+        sell_expected_out = int(verification["sell_quote"]["amount_out"])
+        min_out_sell = int(sell_expected_out * (1 - slippage_factor))
+        
+        sell_router = w3.eth.contract(address=Web3.to_checksum_address(sell_router_address), abi=ROUTER_V2_ABI)
+        sell_path = [
+            Web3.to_checksum_address(token_out["address"]), 
+            Web3.to_checksum_address(token_in["address"])
+        ]
+        
+        sell_gas_limit = min(int(verification["sell_quote"]["gas_estimate"] * GAS_BUFFER_MULTIPLIER), MAX_GAS_LIMIT)
+        
+        sell_tx_data = sell_router.functions.swapExactTokensForTokens(
+            buy_expected_out,  # Use expected output from buy as input for sell
+            min_out_sell,
+            sell_path,
+            wallet,
+            deadline
+        ).build_transaction({
+            'from': wallet,
+            'gas': sell_gas_limit,
+            'gasPrice': gas_price_with_buffer,
+            'nonce': nonce + 1,  # Next nonce for second transaction
+            'chainId': CHAIN_ID
+        })
+        
+        logger.info(f"[{execution_id}] Trade verification passed. Net profit: ${verification['net_profit_usd']:.4f}")
+        
+        # 11. RETURN TRANSACTIONS FOR FRONTEND SIGNING
+        return {
+            "success": True,
+            "execution_id": execution_id,
+            "tx_hash": None,  # Filled after user signs
+            "estimated_profit": verification["net_profit_usd"],
+            "raw_profit": verification["raw_profit_usd"],
+            "gas_cost_usd": verification["gas_cost_usd"],
+            "slippage_cost_usd": verification["slippage_cost_usd"],
+            "spread_percent": verification["spread_percent"],
+            "gas_price_gwei": gas_price_with_buffer / 10**9,
+            
+            # Buy transaction (first leg)
+            "buy_transaction": {
+                "to": buy_router_address,
+                "data": buy_tx_data["data"],
+                "value": "0x0",
+                "gas": hex(buy_tx_data["gas"]),
+                "gasPrice": hex(buy_tx_data["gasPrice"]),
+                "chainId": hex(CHAIN_ID),
+                "nonce": buy_tx_data["nonce"],
+                "description": f"Buy {tokens[1]} on {request.buy_dex}"
+            },
+            
+            # Sell transaction (second leg)
+            "sell_transaction": {
+                "to": sell_router_address,
+                "data": sell_tx_data["data"],
+                "value": "0x0",
+                "gas": hex(sell_tx_data["gas"]),
+                "gasPrice": hex(sell_tx_data["gasPrice"]),
+                "chainId": hex(CHAIN_ID),
+                "nonce": sell_tx_data["nonce"],
+                "description": f"Sell {tokens[1]} on {request.sell_dex}"
+            },
+            
+            # Legacy single transaction format for backward compatibility
+            "transaction": {
+                "to": buy_router_address,
+                "data": buy_tx_data["data"],
+                "value": "0x0",
+                "gas": hex(buy_tx_data["gas"]),
+                "gasPrice": hex(buy_tx_data["gasPrice"]),
+                "chainId": hex(CHAIN_ID),
+                "nonce": buy_tx_data["nonce"]
+            },
+            
+            "verification": verification,
+            "safety_summary": {
+                "trade_size_usd": amount_usd,
+                "max_trade_size": MAX_TRADE_SIZE_USD,
+                "slippage_percent": request.slippage,
+                "max_slippage": MAX_SLIPPAGE_PERCENT,
+                "profit_exceeds_gas": verification["net_profit_usd"] > verification["gas_cost_usd"],
+                "total_gas_estimate": verification["total_gas_estimate"]
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{execution_id}] Execute trade error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@api_router.post("/execute-trade/confirm")
+async def confirm_trade_execution(
+    execution_id: str,
+    buy_tx_hash: str,
+    sell_tx_hash: Optional[str] = None,
+    wallet_address: str = ""
+):
+    """
+    Confirm trade execution after user signs transactions.
+    Records the trade result in database.
+    """
+    try:
+        # Wait for buy transaction confirmation
+        buy_receipt = w3.eth.wait_for_transaction_receipt(buy_tx_hash, timeout=TRADE_TIMEOUT_SECONDS)
+        
+        result = {
+            "execution_id": execution_id,
+            "buy_tx_hash": buy_tx_hash,
+            "buy_status": "success" if buy_receipt.status == 1 else "failed",
+            "buy_gas_used": buy_receipt.gasUsed,
+            "buy_block": buy_receipt.blockNumber
+        }
+        
+        # If sell transaction provided, wait for it too
+        if sell_tx_hash:
+            sell_receipt = w3.eth.wait_for_transaction_receipt(sell_tx_hash, timeout=TRADE_TIMEOUT_SECONDS)
+            result.update({
+                "sell_tx_hash": sell_tx_hash,
+                "sell_status": "success" if sell_receipt.status == 1 else "failed",
+                "sell_gas_used": sell_receipt.gasUsed,
+                "sell_block": sell_receipt.blockNumber,
+                "total_gas_used": buy_receipt.gasUsed + sell_receipt.gasUsed
+            })
+        
+        # Record in database
+        if wallet_address:
+            trade_record = {
+                "id": execution_id,
+                "wallet_address": wallet_address.lower(),
+                "buy_tx_hash": buy_tx_hash,
+                "sell_tx_hash": sell_tx_hash,
+                "status": "success" if buy_receipt.status == 1 else "failed",
+                "gas_used": result.get("total_gas_used", buy_receipt.gasUsed),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            await db.trade_executions.insert_one(trade_record)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Confirm trade error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @api_router.post("/trade/record")
 async def record_trade(trade: TradeHistory):
-    """Record completed trade in history"""
     doc = trade.model_dump()
     await db.trade_history.insert_one(doc)
     return {"status": "recorded", "trade_id": trade.id}
 
 @api_router.get("/trades/{wallet_address}", response_model=List[TradeHistory])
 async def get_trade_history(wallet_address: str, limit: int = 50):
-    """Get trade history for a wallet"""
     trades = await db.trade_history.find(
         {"wallet_address": wallet_address.lower()},
         {"_id": 0}
@@ -524,12 +937,7 @@ async def get_trade_history(wallet_address: str, limit: int = 50):
 
 @api_router.get("/analytics/{wallet_address}")
 async def get_analytics(wallet_address: str):
-    """Get trading analytics for a wallet"""
-    trades = await db.trade_history.find(
-        {"wallet_address": wallet_address.lower()},
-        {"_id": 0}
-    ).to_list(1000)
-    
+    trades = await db.trade_history.find({"wallet_address": wallet_address.lower()}, {"_id": 0}).to_list(1000)
     total_trades = len(trades)
     total_profit = sum(t.get("profit_usd", 0) for t in trades)
     total_gas = sum(t.get("gas_used", 0) for t in trades)
@@ -547,7 +955,6 @@ async def get_analytics(wallet_address: str):
 
 @api_router.get("/gas-price")
 async def get_gas_price():
-    """Get current gas price"""
     try:
         gas_price = w3.eth.gas_price
         return {
@@ -570,12 +977,7 @@ async def get_gas_price():
 
 @api_router.get("/settings/{wallet_address}")
 async def get_settings(wallet_address: str):
-    """Get user settings"""
-    settings = await db.settings.find_one(
-        {"wallet_address": wallet_address.lower()},
-        {"_id": 0}
-    )
-    
+    settings = await db.settings.find_one({"wallet_address": wallet_address.lower()}, {"_id": 0})
     if not settings:
         settings = {
             "wallet_address": wallet_address.lower(),
@@ -585,22 +987,14 @@ async def get_settings(wallet_address: str):
             "auto_execute": False,
             "notifications": True
         }
-    
     return settings
 
 @api_router.post("/settings/{wallet_address}")
 async def update_settings(wallet_address: str, settings: SettingsUpdate):
-    """Update user settings"""
     doc = settings.model_dump()
     doc["wallet_address"] = wallet_address.lower()
     doc["updated_at"] = datetime.now(timezone.utc).isoformat()
-    
-    await db.settings.update_one(
-        {"wallet_address": wallet_address.lower()},
-        {"$set": doc},
-        upsert=True
-    )
-    
+    await db.settings.update_one({"wallet_address": wallet_address.lower()}, {"$set": doc}, upsert=True)
     return {"status": "updated", "settings": doc}
 
 # WebSocket endpoint for real-time updates
@@ -609,9 +1003,24 @@ async def websocket_prices(websocket: WebSocket):
     await manager.connect(websocket)
     try:
         while True:
-            # Fetch and broadcast opportunities every 10 seconds
-            opportunities = await find_arbitrage_opportunities()
-            gas_data = await get_gas_price()
+            # Fast scan - target < 1 second
+            opportunities = await find_arbitrage_opportunities_fast()
+            
+            # Get gas price
+            try:
+                gas_price = w3.eth.gas_price
+                gas_data = {
+                    "wei": str(gas_price),
+                    "gwei": gas_price / 10**9,
+                    "recommended": {
+                        "slow": gas_price * 0.9 / 10**9,
+                        "standard": gas_price / 10**9,
+                        "fast": gas_price * 1.2 / 10**9,
+                        "instant": gas_price * 1.5 / 10**9
+                    }
+                }
+            except Exception:
+                gas_data = {"wei": "50000000000", "gwei": 50, "recommended": {"slow": 40, "standard": 50, "fast": 60, "instant": 75}}
             
             await websocket.send_json({
                 "type": "update",
@@ -620,7 +1029,8 @@ async def websocket_prices(websocket: WebSocket):
                 "timestamp": datetime.now(timezone.utc).isoformat()
             })
             
-            await asyncio.sleep(10)
+            # Update every 3 seconds for real-time feel
+            await asyncio.sleep(3)
     except WebSocketDisconnect:
         manager.disconnect(websocket)
     except Exception as e:

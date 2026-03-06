@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { motion } from 'framer-motion';
 import { 
     Wallet, 
@@ -8,13 +8,12 @@ import {
     RefreshCw, 
     Settings, 
     BarChart3,
-    ArrowUpRight,
-    ArrowDownRight,
     Fuel,
     AlertCircle,
-    Check,
-    X,
-    ChevronRight
+    ChevronRight,
+    CheckCircle2,
+    XCircle,
+    Loader2
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
@@ -22,7 +21,6 @@ import { useWallet } from '@/context/WalletContext';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { 
     Dialog, 
@@ -33,12 +31,24 @@ import {
 } from '@/components/ui/dialog';
 import { Slider } from '@/components/ui/slider';
 import { Label } from '@/components/ui/label';
+import { Input } from '@/components/ui/input';
 import axios from 'axios';
 
 const API_URL = process.env.REACT_APP_BACKEND_URL;
+const WS_URL = API_URL?.replace('https://', 'wss://').replace('http://', 'ws://');
 
 export default function Dashboard() {
-    const { account, isConnected, connect, isConnecting, formatAddress } = useWallet();
+    const { 
+        account, 
+        isConnected, 
+        connect, 
+        isConnecting, 
+        formatAddress, 
+        balances: walletBalances,
+        executeTrade,
+        refreshBalances 
+    } = useWallet();
+    
     const [opportunities, setOpportunities] = useState([]);
     const [gasPrice, setGasPrice] = useState(null);
     const [balances, setBalances] = useState([]);
@@ -46,27 +56,78 @@ export default function Dashboard() {
     const [selectedOpp, setSelectedOpp] = useState(null);
     const [tradeModalOpen, setTradeModalOpen] = useState(false);
     const [slippage, setSlippage] = useState([0.5]);
+    const [tradeAmount, setTradeAmount] = useState('100');
     const [executing, setExecuting] = useState(false);
+    const [tradeResult, setTradeResult] = useState(null);
     const [analytics, setAnalytics] = useState(null);
     const [lastUpdate, setLastUpdate] = useState(new Date());
+    const [wsConnected, setWsConnected] = useState(false);
+    
+    const wsRef = useRef(null);
+    const reconnectTimeoutRef = useRef(null);
 
-    const fetchData = useCallback(async () => {
+    // WebSocket connection
+    const connectWebSocket = useCallback(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) return;
+
         try {
-            const [oppRes, gasRes] = await Promise.all([
-                axios.get(`${API_URL}/api/opportunities`),
-                axios.get(`${API_URL}/api/gas-price`)
-            ]);
+            const ws = new WebSocket(`${WS_URL}/ws/prices`);
             
-            setOpportunities(oppRes.data);
-            setGasPrice(gasRes.data);
-            setLastUpdate(new Date());
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                setWsConnected(true);
+                setLoading(false);
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    if (data.type === 'update') {
+                        setOpportunities(data.opportunities || []);
+                        setGasPrice(data.gas);
+                        setLastUpdate(new Date());
+                    }
+                } catch (e) {
+                    console.error('WebSocket message parse error:', e);
+                }
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                setWsConnected(false);
+                // Reconnect after 3 seconds
+                reconnectTimeoutRef.current = setTimeout(() => {
+                    connectWebSocket();
+                }, 3000);
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                setWsConnected(false);
+            };
+            
+            wsRef.current = ws;
         } catch (error) {
-            console.error('Failed to fetch data:', error);
-        } finally {
+            console.error('WebSocket connection error:', error);
             setLoading(false);
         }
     }, []);
 
+    // Initialize WebSocket on mount
+    useEffect(() => {
+        connectWebSocket();
+        
+        return () => {
+            if (wsRef.current) {
+                wsRef.current.close();
+            }
+            if (reconnectTimeoutRef.current) {
+                clearTimeout(reconnectTimeoutRef.current);
+            }
+        };
+    }, [connectWebSocket]);
+
+    // Fetch balances from API
     const fetchBalances = useCallback(async () => {
         if (!account) return;
         try {
@@ -77,6 +138,7 @@ export default function Dashboard() {
         }
     }, [account]);
 
+    // Fetch analytics
     const fetchAnalytics = useCallback(async () => {
         if (!account) return;
         try {
@@ -88,43 +150,94 @@ export default function Dashboard() {
     }, [account]);
 
     useEffect(() => {
-        fetchData();
-        const interval = setInterval(fetchData, 15000);
-        return () => clearInterval(interval);
-    }, [fetchData]);
-
-    useEffect(() => {
         if (account) {
             fetchBalances();
             fetchAnalytics();
         }
     }, [account, fetchBalances, fetchAnalytics]);
 
+    // Execute trade handler
     const handleExecuteTrade = async () => {
-        if (!selectedOpp || !account) return;
+        if (!selectedOpp || !account) {
+            toast.error('Please connect wallet first');
+            return;
+        }
         
         setExecuting(true);
+        setTradeResult(null);
+        
         try {
-            const res = await axios.post(`${API_URL}/api/trade/build`, {
-                opportunity_id: selectedOpp.id,
-                wallet_address: account,
-                slippage_tolerance: slippage[0]
+            // Call backend to verify and build transaction
+            const response = await axios.post(`${API_URL}/api/execute-trade`, {
+                pair: selectedOpp.token_pair,
+                buy_dex: selectedOpp.buy_dex,
+                sell_dex: selectedOpp.sell_dex,
+                amount: selectedOpp.amount_in,
+                slippage: slippage[0],
+                wallet_address: account
             });
-
-            toast.success('Trade transaction built! Please confirm in MetaMask.');
             
-            // In a real implementation, you would send this transaction via ethers.js
-            console.log('Transaction data:', res.data);
+            if (!response.data.success) {
+                setTradeResult({
+                    success: false,
+                    error: response.data.error || 'Trade verification failed'
+                });
+                toast.error(response.data.error || 'Trade verification failed');
+                return;
+            }
             
-            setTradeModalOpen(false);
+            // Execute via MetaMask
+            const result = await executeTrade(response.data.transaction);
+            
+            if (result.success) {
+                setTradeResult({
+                    success: true,
+                    tx_hash: result.tx_hash,
+                    estimated_profit: response.data.estimated_profit,
+                    gas_used: result.gas_used
+                });
+                
+                // Record trade
+                await axios.post(`${API_URL}/api/trade/record`, {
+                    wallet_address: account.toLowerCase(),
+                    token_pair: selectedOpp.token_pair,
+                    buy_dex: selectedOpp.buy_dex,
+                    sell_dex: selectedOpp.sell_dex,
+                    amount_in: selectedOpp.amount_in,
+                    amount_out: selectedOpp.expected_out,
+                    profit_usd: response.data.estimated_profit,
+                    gas_used: parseInt(result.gas_used),
+                    tx_hash: result.tx_hash,
+                    status: 'success'
+                });
+                
+                // Refresh data
+                fetchBalances();
+                fetchAnalytics();
+                refreshBalances();
+            } else {
+                setTradeResult({
+                    success: false,
+                    error: result.error
+                });
+            }
         } catch (error) {
-            toast.error('Failed to execute trade: ' + (error.response?.data?.detail || error.message));
+            console.error('Trade execution error:', error);
+            setTradeResult({
+                success: false,
+                error: error.response?.data?.detail || error.message
+            });
+            toast.error('Trade failed: ' + (error.response?.data?.detail || error.message));
         } finally {
             setExecuting(false);
         }
     };
 
-    const totalPortfolioValue = balances.reduce((sum, b) => sum + (parseFloat(b.usd_value) || 0), 0);
+    const closeModal = () => {
+        setTradeModalOpen(false);
+        setSelectedOpp(null);
+        setTradeResult(null);
+    };
 
     return (
         <div className="min-h-screen bg-[#050505]">
@@ -149,6 +262,12 @@ export default function Dashboard() {
                         </nav>
 
                         <div className="flex items-center gap-3">
+                            {/* WebSocket Status */}
+                            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 text-xs">
+                                <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-[#39FF14]' : 'bg-[#FF003C]'}`} />
+                                <span className="text-white/50">{wsConnected ? 'Live' : 'Offline'}</span>
+                            </div>
+                            
                             {isConnected ? (
                                 <Button 
                                     data-testid="wallet-connected-btn"
@@ -177,11 +296,7 @@ export default function Dashboard() {
             <main className="container mx-auto px-4 py-6">
                 {/* Stats Row */}
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.1 }}
-                    >
+                    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.1 }}>
                         <Card className="stat-card" data-testid="total-opportunities-card">
                             <CardContent className="p-6">
                                 <div className="flex items-center justify-between">
@@ -197,11 +312,7 @@ export default function Dashboard() {
                         </Card>
                     </motion.div>
 
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.2 }}
-                    >
+                    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
                         <Card className="stat-card secondary" data-testid="gas-price-card">
                             <CardContent className="p-6">
                                 <div className="flex items-center justify-between">
@@ -220,11 +331,7 @@ export default function Dashboard() {
                         </Card>
                     </motion.div>
 
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.3 }}
-                    >
+                    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
                         <Card className="stat-card success" data-testid="total-profit-card">
                             <CardContent className="p-6">
                                 <div className="flex items-center justify-between">
@@ -242,11 +349,7 @@ export default function Dashboard() {
                         </Card>
                     </motion.div>
 
-                    <motion.div
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ delay: 0.4 }}
-                    >
+                    <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.4 }}>
                         <Card className="glass-card" data-testid="success-rate-card">
                             <CardContent className="p-6">
                                 <div className="flex items-center justify-between">
@@ -273,20 +376,13 @@ export default function Dashboard() {
                                 <div className="flex items-center gap-3">
                                     <CardTitle className="text-xl">Arbitrage Opportunities</CardTitle>
                                     <div className="flex items-center gap-2 text-xs text-white/50">
-                                        <div className="live-indicator" />
-                                        <span>Live</span>
+                                        <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-[#39FF14] animate-pulse' : 'bg-[#FF003C]'}`} />
+                                        <span>{wsConnected ? 'Real-time' : 'Reconnecting...'}</span>
                                     </div>
                                 </div>
-                                <Button 
-                                    variant="ghost" 
-                                    size="sm" 
-                                    onClick={fetchData}
-                                    data-testid="refresh-btn"
-                                    className="text-white/60 hover:text-white"
-                                >
-                                    <RefreshCw className="w-4 h-4 mr-2" />
-                                    Refresh
-                                </Button>
+                                <div className="text-xs text-white/40">
+                                    Updated: {lastUpdate.toLocaleTimeString()}
+                                </div>
                             </CardHeader>
                             <CardContent>
                                 <ScrollArea className="h-[500px] scrollbar-thin">
@@ -390,9 +486,36 @@ export default function Dashboard() {
                                         </Button>
                                     </div>
                                 ) : (
-                                    <ScrollArea className="h-[300px]">
+                                    <ScrollArea className="h-[200px]">
                                         <div className="space-y-3">
-                                            {balances.map((balance, idx) => (
+                                            {/* Show wallet context balances first */}
+                                            <div className="flex items-center justify-between p-3 rounded-lg bg-white/5 hover:bg-white/10 transition-colors">
+                                                <div className="flex items-center gap-3">
+                                                    <div className="w-8 h-8 rounded-full bg-[#FF9F1C]/20 flex items-center justify-center text-xs font-bold text-[#FF9F1C]">
+                                                        BE
+                                                    </div>
+                                                    <span className="font-medium">BERA</span>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="font-mono text-sm">
+                                                        {parseFloat(walletBalances.BERA || '0').toFixed(4)}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            <div className="flex items-center justify-between p-3 rounded-lg bg-white/5 hover:bg-white/10 transition-colors">
+                                                <div className="flex items-center gap-3">
+                                                    <div className="w-8 h-8 rounded-full bg-[#FFD60A]/20 flex items-center justify-center text-xs font-bold text-[#FFD60A]">
+                                                        HO
+                                                    </div>
+                                                    <span className="font-medium">HONEY</span>
+                                                </div>
+                                                <div className="text-right">
+                                                    <p className="font-mono text-sm">
+                                                        {parseFloat(walletBalances.HONEY || '0').toFixed(4)}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                            {balances.filter(b => b.symbol !== 'BERA' && b.symbol !== 'HONEY').map((balance) => (
                                                 <div 
                                                     key={balance.symbol} 
                                                     className="flex items-center justify-between p-3 rounded-lg bg-white/5 hover:bg-white/10 transition-colors"
@@ -468,13 +591,54 @@ export default function Dashboard() {
             </main>
 
             {/* Trade Execution Modal */}
-            <Dialog open={tradeModalOpen} onOpenChange={setTradeModalOpen}>
+            <Dialog open={tradeModalOpen} onOpenChange={closeModal}>
                 <DialogContent className="trade-modal sm:max-w-[500px]" data-testid="trade-modal">
                     <DialogHeader>
-                        <DialogTitle className="text-xl">Execute Arbitrage Trade</DialogTitle>
+                        <DialogTitle className="text-xl">
+                            {tradeResult ? (tradeResult.success ? 'Trade Successful!' : 'Trade Failed') : 'Execute Arbitrage Trade'}
+                        </DialogTitle>
                     </DialogHeader>
                     
-                    {selectedOpp && (
+                    {tradeResult ? (
+                        // Trade result view
+                        <div className="space-y-6 py-4">
+                            <div className="flex flex-col items-center justify-center py-6">
+                                {tradeResult.success ? (
+                                    <>
+                                        <CheckCircle2 className="w-16 h-16 text-[#39FF14] mb-4" />
+                                        <p className="text-lg font-semibold text-[#39FF14]">Trade Executed Successfully!</p>
+                                        <p className="text-sm text-white/50 mt-2">
+                                            Estimated profit: <span className="text-[#39FF14] font-mono">${tradeResult.estimated_profit?.toFixed(2)}</span>
+                                        </p>
+                                        {tradeResult.tx_hash && (
+                                            <a 
+                                                href={`https://berascan.com/tx/${tradeResult.tx_hash}`}
+                                                target="_blank"
+                                                rel="noopener noreferrer"
+                                                className="mt-4 text-sm text-[#00F0FF] hover:underline"
+                                            >
+                                                View on Berascan →
+                                            </a>
+                                        )}
+                                    </>
+                                ) : (
+                                    <>
+                                        <XCircle className="w-16 h-16 text-[#FF003C] mb-4" />
+                                        <p className="text-lg font-semibold text-[#FF003C]">Trade Failed</p>
+                                        <p className="text-sm text-white/50 mt-2 text-center">
+                                            {tradeResult.error}
+                                        </p>
+                                    </>
+                                )}
+                            </div>
+                            <DialogFooter>
+                                <Button onClick={closeModal} className="w-full btn-secondary">
+                                    Close
+                                </Button>
+                            </DialogFooter>
+                        </div>
+                    ) : selectedOpp && (
+                        // Trade confirmation view
                         <div className="space-y-6 py-4">
                             {/* Trade Details */}
                             <div className="glass-card p-4 rounded-lg">
@@ -527,7 +691,7 @@ export default function Dashboard() {
                                     data-testid="slippage-slider"
                                 />
                                 <p className="text-xs text-white/50">
-                                    Your transaction will revert if the price changes more than this percentage.
+                                    Transaction reverts if price changes more than this percentage.
                                 </p>
                             </div>
 
@@ -535,41 +699,41 @@ export default function Dashboard() {
                             <div className="flex items-start gap-3 p-3 rounded-lg bg-[#FFD60A]/10 border border-[#FFD60A]/30">
                                 <AlertCircle className="w-5 h-5 text-[#FFD60A] flex-shrink-0 mt-0.5" />
                                 <p className="text-xs text-[#FFD60A]/90">
-                                    Arbitrage opportunities are time-sensitive. Prices may change before execution. 
-                                    Always verify the transaction in MetaMask before confirming.
+                                    Prices are verified on-chain before execution. Trade will be rejected if no longer profitable.
                                 </p>
                             </div>
+
+                            <DialogFooter className="gap-3">
+                                <Button 
+                                    variant="outline" 
+                                    onClick={closeModal}
+                                    className="border-white/20"
+                                    data-testid="cancel-trade-btn"
+                                    disabled={executing}
+                                >
+                                    Cancel
+                                </Button>
+                                <Button 
+                                    onClick={handleExecuteTrade}
+                                    disabled={!isConnected || executing}
+                                    className="btn-primary"
+                                    data-testid="execute-trade-btn"
+                                >
+                                    {executing ? (
+                                        <>
+                                            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            Executing...
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Zap className="w-4 h-4 mr-2" />
+                                            Execute Trade
+                                        </>
+                                    )}
+                                </Button>
+                            </DialogFooter>
                         </div>
                     )}
-
-                    <DialogFooter className="gap-3">
-                        <Button 
-                            variant="outline" 
-                            onClick={() => setTradeModalOpen(false)}
-                            className="border-white/20"
-                            data-testid="cancel-trade-btn"
-                        >
-                            Cancel
-                        </Button>
-                        <Button 
-                            onClick={handleExecuteTrade}
-                            disabled={!isConnected || executing}
-                            className="btn-primary"
-                            data-testid="execute-trade-btn"
-                        >
-                            {executing ? (
-                                <>
-                                    <RefreshCw className="w-4 h-4 mr-2 animate-spin" />
-                                    Building Transaction...
-                                </>
-                            ) : (
-                                <>
-                                    <Zap className="w-4 h-4 mr-2" />
-                                    Execute Trade
-                                </>
-                            )}
-                        </Button>
-                    </DialogFooter>
                 </DialogContent>
             </Dialog>
         </div>
