@@ -1,34 +1,228 @@
-.App-logo {
-    height: 40vmin;
-    pointer-events: none;
-}
+/* Berachain Arbitrage Bot - App Styles */
 
-@media (prefers-reduced-motion: no-preference) {
-    .App-logo {
-        animation: App-logo-spin infinite 20s linear;
-    }
-}
-
-.App-header {
-    background-color: #0f0f10;
+.App {
     min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-size: calc(10px + 2vmin);
-    color: white;
+    background: #050505;
 }
 
-.App-link {
-    color: #61dafb;
+/* Background effects */
+.bg-grid-pattern {
+    background-image: 
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 50px 50px;
 }
 
-@keyframes App-logo-spin {
-    from {
-        transform: rotate(0deg);
+/* Header styles */
+.header-gradient {
+    background: linear-gradient(180deg, rgba(5, 5, 5, 1) 0%, rgba(5, 5, 5, 0.8) 100%);
+    backdrop-filter: blur(20px);
+}
+
+/* Card variations */
+.opportunity-card {
+    background: rgba(0, 0, 0, 0.4);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 16px;
+    transition: all 0.3s ease;
+}
+
+.opportunity-card:hover {
+    border-color: rgba(255, 159, 28, 0.5);
+    transform: translateY(-2px);
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+}
+
+.opportunity-card.high-profit {
+    border-color: rgba(57, 255, 20, 0.3);
+}
+
+.opportunity-card.high-profit:hover {
+    border-color: rgba(57, 255, 20, 0.6);
+    box-shadow: 0 0 40px rgba(57, 255, 20, 0.2);
+}
+
+/* Stat cards */
+.stat-card {
+    background: linear-gradient(135deg, rgba(255, 159, 28, 0.1) 0%, rgba(255, 159, 28, 0) 100%);
+    border: 1px solid rgba(255, 159, 28, 0.2);
+}
+
+.stat-card.secondary {
+    background: linear-gradient(135deg, rgba(0, 240, 255, 0.1) 0%, rgba(0, 240, 255, 0) 100%);
+    border: 1px solid rgba(0, 240, 255, 0.2);
+}
+
+.stat-card.success {
+    background: linear-gradient(135deg, rgba(57, 255, 20, 0.1) 0%, rgba(57, 255, 20, 0) 100%);
+    border: 1px solid rgba(57, 255, 20, 0.2);
+}
+
+/* Price indicators */
+.price-up {
+    color: #39FF14;
+}
+
+.price-down {
+    color: #FF003C;
+}
+
+.price-neutral {
+    color: #A1A1AA;
+}
+
+/* Wallet connection button */
+.wallet-btn {
+    background: linear-gradient(135deg, #FF9F1C 0%, #FFD60A 100%);
+    color: #000;
+    font-weight: 700;
+    padding: 10px 24px;
+    border-radius: 8px;
+    transition: all 0.3s ease;
+}
+
+.wallet-btn:hover {
+    transform: scale(1.02);
+    box-shadow: 0 0 30px rgba(255, 159, 28, 0.4);
+}
+
+.wallet-btn.connected {
+    background: linear-gradient(135deg, rgba(57, 255, 20, 0.2) 0%, rgba(57, 255, 20, 0.1) 100%);
+    border: 1px solid rgba(57, 255, 20, 0.5);
+    color: #39FF14;
+}
+
+/* Pulse animation for live data */
+.live-indicator {
+    width: 8px;
+    height: 8px;
+    background: #39FF14;
+    border-radius: 50%;
+    animation: pulse-live 2s infinite;
+}
+
+@keyframes pulse-live {
+    0%, 100% {
+        opacity: 1;
+        box-shadow: 0 0 0 0 rgba(57, 255, 20, 0.7);
     }
-    to {
-        transform: rotate(360deg);
+    50% {
+        opacity: 0.8;
+        box-shadow: 0 0 0 8px rgba(57, 255, 20, 0);
+    }
+}
+
+/* Progress bar */
+.profit-progress {
+    height: 4px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 2px;
+    overflow: hidden;
+}
+
+.profit-progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #FF9F1C, #39FF14);
+    transition: width 0.5s ease;
+}
+
+/* Tooltip styles */
+.custom-tooltip {
+    background: rgba(0, 0, 0, 0.9) !important;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255, 255, 255, 0.1) !important;
+    border-radius: 8px;
+    padding: 12px 16px;
+}
+
+/* Tab styles */
+.tab-active {
+    background: rgba(255, 159, 28, 0.2);
+    border-color: rgba(255, 159, 28, 0.5);
+    color: #FF9F1C;
+}
+
+/* Input focus states */
+input:focus, select:focus {
+    outline: none;
+    border-color: #FF9F1C !important;
+    box-shadow: 0 0 0 2px rgba(255, 159, 28, 0.2);
+}
+
+/* Scrollbar customization */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: rgba(255, 255, 255, 0.05);
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.3);
+}
+
+/* Loading skeleton */
+.skeleton {
+    background: linear-gradient(90deg, rgba(255, 255, 255, 0.05) 0%, rgba(255, 255, 255, 0.1) 50%, rgba(255, 255, 255, 0.05) 100%);
+    background-size: 200% 100%;
+    animation: skeleton-loading 1.5s infinite;
+}
+
+@keyframes skeleton-loading {
+    0% {
+        background-position: 200% 0;
+    }
+    100% {
+        background-position: -200% 0;
+    }
+}
+
+/* Trade execution modal */
+.trade-modal-overlay {
+    background: rgba(0, 0, 0, 0.8);
+    backdrop-filter: blur(10px);
+}
+
+.trade-modal {
+    background: #0F1115;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 20px;
+}
+
+/* Success/Error states */
+.status-success {
+    background: rgba(57, 255, 20, 0.1);
+    border: 1px solid rgba(57, 255, 20, 0.3);
+    color: #39FF14;
+}
+
+.status-error {
+    background: rgba(255, 0, 60, 0.1);
+    border: 1px solid rgba(255, 0, 60, 0.3);
+    color: #FF003C;
+}
+
+.status-pending {
+    background: rgba(255, 214, 10, 0.1);
+    border: 1px solid rgba(255, 214, 10, 0.3);
+    color: #FFD60A;
+}
+
+/* Responsive adjustments */
+@media (max-width: 768px) {
+    .opportunity-card {
+        padding: 16px;
+    }
+    
+    .stat-card {
+        padding: 16px;
     }
 }
