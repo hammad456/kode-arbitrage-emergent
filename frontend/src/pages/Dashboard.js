@@ -208,7 +208,7 @@ export default function Dashboard() {
                                     <div>
                                         <p className="label-text mb-1">Gas Price</p>
                                         <p className="value-large text-[#00F0FF]">
-                                            {gasPrice ? `${gasPrice.gwei.toFixed(1)}` : '--'} 
+                                            {gasPrice ? (gasPrice.gwei < 0.01 ? '<0.01' : gasPrice.gwei.toFixed(2)) : '--'} 
                                             <span className="text-sm text-white/50 ml-1">gwei</span>
                                         </p>
                                     </div>
@@ -434,7 +434,7 @@ export default function Dashboard() {
                                             >
                                                 <span className="capitalize text-white/70">{speed}</span>
                                                 <span className="font-mono text-[#00F0FF]">
-                                                    {price.toFixed(1)} gwei
+                                                    {price < 0.01 ? '<0.01' : price.toFixed(2)} gwei
                                                 </span>
                                             </div>
                                         ))}
