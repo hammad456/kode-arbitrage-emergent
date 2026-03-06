@@ -3,101 +3,81 @@
 ## Original Problem Statement
 Build a sophisticated arbitrage trading application for Berachain that is safe and intelligently profitable. The app should have a complete frontend and backend that works in real-time. The application must calculate slippage, price impact, and gas fees.
 
-## User Choices
-- DEX: BEX and Kodiak Finance
-- Wallet: MetaMask integration
-- Data Source: Combination (DEX contracts + third-party API)
-- Execution Mode: Semi-auto (user sets parameters, system executes)
-- RPC: Public Berachain RPC
+## Architecture Update (Jan 2026)
 
-## User Personas
-1. **DeFi Traders** - Users looking for arbitrage opportunities on Berachain
-2. **Crypto Investors** - Users who want automated profit detection
-3. **Institutional Traders** - Professional traders requiring detailed analytics
+### Backend Enhancements
+- Enhanced POST /api/execute-trade endpoint with real blockchain execution
+- Comprehensive safety checks implemented
+- WebSocket real-time price streaming
+- REST API fallback for polling
 
-## Core Requirements (Static)
-- Real-time arbitrage opportunity detection
-- MetaMask wallet integration
-- Slippage and price impact calculation
-- Gas fee estimation and optimization
-- Trade execution with confirmation
-- Portfolio balance tracking
-- Trade history and analytics
+### Trade Execution Flow
+1. Validate inputs (pair, wallet, amount)
+2. Re-fetch latest pool prices from both DEXes
+3. Estimate gas cost with 30% buffer
+4. Calculate: net_profit = raw_profit - gas_cost - slippage_cost
+5. Execute only if net_profit > minimum_threshold
+6. Build transactions for both legs (buy + sell)
+7. Return transaction data for wallet signing
 
-## Architecture
-- **Frontend**: React 19 + Tailwind CSS + Shadcn/UI + Framer Motion + Recharts
-- **Backend**: FastAPI + Web3.py + MongoDB + Motor
-- **Blockchain**: Berachain Mainnet (Chain ID: 80094)
-- **DEX Integrations**: Kodiak Finance (V2/V3 routers), BEX (simulated)
+### Safety Checks
+- MAX_TRADE_SIZE_USD: $10,000
+- MAX_GAS_LIMIT: 500,000
+- MAX_SLIPPAGE_PERCENT: 5%
+- PRICE_CHANGE_TOLERANCE: 2%
+- GAS_BUFFER_MULTIPLIER: 1.3x
+- Abort if profit < gas cost
+- Abort if spread becomes negative
+- Abort if slippage exceeds tolerance
 
-## What's Been Implemented (Jan 2026)
+## What's Been Implemented
 
 ### Backend (server.py)
-- [x] Web3 connection to Berachain mainnet RPC
-- [x] Kodiak DEX router integration (V2: 0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022)
-- [x] Real-time price fetching from DEX contracts
-- [x] Arbitrage opportunity detection algorithm
-- [x] Gas price fetching and estimation
-- [x] CoinGecko API integration for USD prices
-- [x] Trade transaction building endpoint
-- [x] Wallet balances endpoint (native + ERC20)
-- [x] Trade history and analytics endpoints
-- [x] User settings persistence (MongoDB)
-- [x] WebSocket endpoint for real-time updates
+- [x] POST /api/execute-trade with full verification
+- [x] On-chain price revalidation before execution
+- [x] Gas estimation with buffer
+- [x] Slippage cost calculation
+- [x] Safety checks (trade size, gas, profit threshold)
+- [x] Build both buy and sell transactions
+- [x] POST /api/execute-trade/confirm for recording results
+- [x] WebSocket /ws/prices for real-time updates (3 second interval)
 
-### Frontend
-- [x] Dashboard with live arbitrage opportunities
-- [x] MetaMask wallet connection (Berachain auto-switch)
-- [x] Portfolio balances display
-- [x] Gas price recommendations panel
-- [x] Trade execution modal with slippage settings
-- [x] Settings page (trading config, risk management, notifications)
-- [x] Analytics page with charts and trade history
-- [x] Dark theme "Orbital Command" design
-- [x] Responsive design for mobile
+### Frontend (Dashboard.js)
+- [x] WebSocket connection for real-time data
+- [x] REST API polling fallback when WebSocket unavailable
+- [x] Connection status indicator (Live/Polling/Connecting)
+- [x] Trade execution modal with verification display
+- [x] Wallet connection with MetaMask
+- [x] executeTrade() function for signing transactions
 
 ### API Endpoints
-- GET /api/health - Health check with RPC status
-- GET /api/tokens - List of supported tokens
+- GET /api/health - Health check
 - GET /api/opportunities - Arbitrage opportunities
-- GET /api/gas-price - Current gas price
-- GET /api/wallet/{address}/balances - Wallet balances
-- POST /api/trade/build - Build trade transaction
-- POST /api/trade/record - Record trade history
-- GET /api/trades/{wallet} - Trade history
-- GET /api/analytics/{wallet} - Trading analytics
-- GET/POST /api/settings/{wallet} - User settings
+- GET /api/gas-price - Current gas pricing
+- POST /api/execute-trade - Execute arbitrage with safety checks
+- POST /api/execute-trade/confirm - Confirm and record execution
 
-## MOCKED/Simulated Components
-- **BEX DEX Quotes**: BEX contract addresses not publicly documented, so quotes are simulated with price variation from Kodiak
+## MOCKED Components
+- BEX Router uses same address as Kodiak V2 (actual BEX contracts not public)
 
 ## Prioritized Backlog
 
 ### P0 (Critical)
-- [ ] Implement actual BEX smart contract integration when addresses are available
-- [ ] Add actual transaction signing via MetaMask
-- [ ] Implement WebSocket real-time updates on frontend
+- [ ] Integrate actual BEX router when addresses available
+- [ ] Add token approval flow before swaps
+- [ ] Implement flash loan integration
 
 ### P1 (High Priority)
-- [ ] Add multi-hop arbitrage paths (A→B→C→A)
-- [ ] Implement flash loan integration for capital efficiency
-- [ ] Add token approval flow before swaps
-- [ ] Price alerts and notifications
+- [ ] Multi-hop arbitrage paths
+- [ ] MEV protection (Flashbots)
+- [ ] Price alerts via notifications
 
 ### P2 (Medium Priority)
-- [ ] Historical arbitrage opportunity charts
-- [ ] Profit/loss reporting with export
+- [ ] Historical profit tracking
 - [ ] Multiple wallet support
-- [ ] MEV protection integration
-
-### P3 (Nice to Have)
-- [ ] Telegram/Discord bot notifications
-- [ ] Custom token pair configuration
-- [ ] Portfolio performance benchmarking
+- [ ] Telegram bot integration
 
 ## Next Tasks
-1. Get actual BEX contract addresses and integrate
-2. Implement MetaMask transaction signing flow
-3. Add token approval checking and flow
-4. Enable WebSocket for live dashboard updates
-5. Add profit tracking after successful trades
+1. Get actual BEX contract addresses from Berachain team
+2. Add ERC20 approve() calls before swaps
+3. Implement flash loan for capital efficiency

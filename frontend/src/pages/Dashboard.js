@@ -65,8 +65,27 @@ export default function Dashboard() {
     
     const wsRef = useRef(null);
     const reconnectTimeoutRef = useRef(null);
+    const pollingIntervalRef = useRef(null);
 
-    // WebSocket connection
+    // Fetch data via REST API (fallback when WebSocket unavailable)
+    const fetchDataREST = useCallback(async () => {
+        try {
+            const [oppRes, gasRes] = await Promise.all([
+                axios.get(`${API_URL}/api/opportunities`),
+                axios.get(`${API_URL}/api/gas-price`)
+            ]);
+            
+            setOpportunities(oppRes.data);
+            setGasPrice(gasRes.data);
+            setLastUpdate(new Date());
+            setLoading(false);
+        } catch (error) {
+            console.error('Failed to fetch data:', error);
+            setLoading(false);
+        }
+    }, []);
+
+    // WebSocket connection with REST API fallback
     const connectWebSocket = useCallback(() => {
         if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
@@ -77,6 +96,11 @@ export default function Dashboard() {
                 console.log('WebSocket connected');
                 setWsConnected(true);
                 setLoading(false);
+                // Clear polling if WebSocket connects
+                if (pollingIntervalRef.current) {
+                    clearInterval(pollingIntervalRef.current);
+                    pollingIntervalRef.current = null;
+                }
             };
             
             ws.onmessage = (event) => {
@@ -95,23 +119,38 @@ export default function Dashboard() {
             ws.onclose = () => {
                 console.log('WebSocket disconnected');
                 setWsConnected(false);
-                // Reconnect after 3 seconds
+                // Start polling fallback
+                if (!pollingIntervalRef.current) {
+                    fetchDataREST();
+                    pollingIntervalRef.current = setInterval(fetchDataREST, 5000);
+                }
+                // Reconnect after 5 seconds
                 reconnectTimeoutRef.current = setTimeout(() => {
                     connectWebSocket();
-                }, 3000);
+                }, 5000);
             };
             
             ws.onerror = (error) => {
                 console.error('WebSocket error:', error);
                 setWsConnected(false);
+                // Start polling fallback on error
+                if (!pollingIntervalRef.current) {
+                    fetchDataREST();
+                    pollingIntervalRef.current = setInterval(fetchDataREST, 5000);
+                }
             };
             
             wsRef.current = ws;
         } catch (error) {
             console.error('WebSocket connection error:', error);
             setLoading(false);
+            // Fallback to polling
+            if (!pollingIntervalRef.current) {
+                fetchDataREST();
+                pollingIntervalRef.current = setInterval(fetchDataREST, 5000);
+            }
         }
-    }, []);
+    }, [fetchDataREST]);
 
     // Initialize WebSocket on mount
     useEffect(() => {
@@ -123,6 +162,9 @@ export default function Dashboard() {
             }
             if (reconnectTimeoutRef.current) {
                 clearTimeout(reconnectTimeoutRef.current);
+            }
+            if (pollingIntervalRef.current) {
+                clearInterval(pollingIntervalRef.current);
             }
         };
     }, [connectWebSocket]);
@@ -262,10 +304,12 @@ export default function Dashboard() {
                         </nav>
 
                         <div className="flex items-center gap-3">
-                            {/* WebSocket Status */}
+                            {/* Connection Status */}
                             <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 text-xs">
-                                <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-[#39FF14]' : 'bg-[#FF003C]'}`} />
-                                <span className="text-white/50">{wsConnected ? 'Live' : 'Offline'}</span>
+                                <div className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-[#39FF14]' : opportunities.length > 0 ? 'bg-[#FFD60A]' : 'bg-[#FF003C]'} ${wsConnected ? 'animate-pulse' : ''}`} />
+                                <span className="text-white/50">
+                                    {wsConnected ? 'Live' : opportunities.length > 0 ? 'Polling' : 'Connecting...'}
+                                </span>
                             </div>
                             
                             {isConnected ? (
