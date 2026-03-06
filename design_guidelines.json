@@ -1,0 +1,125 @@
+{
+  "identity": {
+    "persona": "E1: The Anti-AI Designer",
+    "mission": "Create a high-performance, dark-mode arbitrage trading terminal that feels like a tactical command center, not a generic SaaS dashboard.",
+    "principles": [
+      "Fusion over Imitation: Blend 'Bloomberg Terminal' data density with 'Cyberpunk' aesthetics.",
+      "Emotion First: The user should feel powerful, informed, and precise.",
+      "Content is King: Data is the hero. Use negative space to highlight critical numbers.",
+      "Zoom In: Focus on the 'Profit' metrics with bold typography."
+    ],
+    "anti_patterns": [
+      "No 'SaaS Blue' allowed.",
+      "No 'Inter' for headings.",
+      "No 'Center-Everything' layouts.",
+      "No gradients > 20% opacity."
+    ]
+  },
+  "typography": {
+    "fonts": {
+      "headings": {
+        "family": "Space Grotesk",
+        "weights": ["Bold (700)", "Black (900)"],
+        "usage": "Page titles, major section headers, profit figures."
+      },
+      "body": {
+        "family": "Inter",
+        "weights": ["Regular (400)", "Medium (500)"],
+        "usage": "General text, descriptions, labels."
+      },
+      "data": {
+        "family": "JetBrains Mono",
+        "weights": ["Regular (400)", "Bold (700)"],
+        "usage": "Prices, percentages, addresses, transaction hashes."
+      }
+    },
+    "scale": {
+      "hero": "text-5xl md:text-7xl tracking-tighter",
+      "h1": "text-4xl tracking-tight font-bold",
+      "h2": "text-3xl tracking-tight font-semibold",
+      "h3": "text-2xl font-medium",
+      "data_large": "text-3xl font-mono tracking-tight",
+      "data_medium": "text-xl font-mono",
+      "label": "text-xs uppercase tracking-widest text-muted-foreground"
+    }
+  },
+  "colors": {
+    "palette": {
+      "background": "#050505",
+      "surface": "#0F1115",
+      "surface_highlight": "#1A1D24",
+      "primary": "#FF9F1C",
+      "primary_foreground": "#000000",
+      "secondary": "#00F0FF",
+      "secondary_foreground": "#000000",
+      "success": "#39FF14",
+      "warning": "#FFD60A",
+      "error": "#FF003C",
+      "text_primary": "#FFFFFF",
+      "text_secondary": "#A1A1AA",
+      "border": "rgba(255, 255, 255, 0.1)"
+    },
+    "gradients": {
+      "primary_glow": "linear-gradient(135deg, rgba(255, 159, 28, 0.2) 0%, rgba(255, 159, 28, 0) 100%)",
+      "cyber_glow": "linear-gradient(135deg, rgba(0, 240, 255, 0.2) 0%, rgba(0, 240, 255, 0) 100%)"
+    }
+  },
+  "layout_strategy": {
+    "grid_system": "Mode B: High Density Grid",
+    "container_style": "Bento Grid with 1px visible borders (5% opacity)",
+    "spacing": {
+      "section_gap": "gap-4",
+      "component_padding": "p-4 md:p-6"
+    },
+    "responsive": "Mobile-first. Stack columns on mobile, expand to 3-4 columns on desktop."
+  },
+  "components": {
+    "cards": {
+      "style": "Glassmorphism",
+      "classes": "bg-black/40 backdrop-blur-xl border border-white/10 shadow-2xl rounded-xl"
+    },
+    "buttons": {
+      "primary": "bg-[#FF9F1C] text-black hover:bg-[#FF9F1C]/90 rounded-md font-bold uppercase tracking-wide transition-all",
+      "secondary": "border border-white/20 hover:bg-white/5 text-white rounded-md uppercase tracking-wide transition-all",
+      "icon": "p-2 rounded-full hover:bg-white/10 transition-colors"
+    },
+    "inputs": {
+      "style": "bg-black/20 border-white/10 focus:border-[#FF9F1C] text-white placeholder:text-white/30 rounded-md"
+    },
+    "charts": {
+      "library": "recharts",
+      "style": "Minimalist, no grid lines, custom tooltips with glassmorphism."
+    },
+    "tables": {
+      "style": "Compact, mono-spaced numbers, row hover effects (bg-white/5)."
+    }
+  },
+  "assets": {
+    "images": {
+      "background_network": "https://images.unsplash.com/photo-1772050138764-2b1925e0c6b2?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA2MjJ8MHwxfHNlYXJjaHwyfHxhYnN0cmFjdCUyMGRhcmslMjBkaWdpdGFsJTIwbmV0d29yayUyMGRhdGElMjBmbG93JTIwYmFja2dyb3VuZHxlbnwwfHx8fDE3NzI4MzQ3NTB8MA&ixlib=rb-4.1.0&q=85",
+      "ethereum_logo": "https://images.unsplash.com/photo-1651221436727-28b9c922db97?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDk1Nzl8MHwxfHNlYXJjaHwxfHxldGhlcmV1bSUyMGxvZ28lMjBjb2lufGVufDB8fHx8MTc3MjgzNDc1OHww&ixlib=rb-4.1.0&q=85",
+      "bitcoin_logo": "https://images.unsplash.com/photo-1707075891517-c23d276feef7?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2NzV8MHwxfHNlYXJjaHwxfHxiaXRjb2luJTIwbG9nbyUyMGNvaW58ZW58MHx8fHwxNzcyODM0NzU5fDA&ixlib=rb-4.1.0&q=85"
+    },
+    "icons": {
+      "library": "lucide-react",
+      "usage": "Use stroke-width={1.5} for a refined look."
+    }
+  },
+  "instructions_to_main_agent": [
+    "1. IMPLEMENT DARK MODE ONLY: Set 'class' strategy in tailwind.config.js and ensure 'dark' class is always applied to html/body.",
+    "2. INSTALL DEPENDENCIES: Install 'lucide-react', 'recharts', 'sonner', 'framer-motion', 'clsx', 'tailwind-merge' if not present.",
+    "3. FONTS: Import 'Space Grotesk', 'Inter', and 'JetBrains Mono' from Google Fonts or local assets.",
+    "4. SHADCN: Customize standard components (Card, Button, Input) to match the 'Glassmorphism' style defined in 'components' section.",
+    "5. CHARTS: Use Recharts for the Profit/Loss and Price History charts. Style them minimally.",
+    "6. TABLES: Build a custom data table for the 'Arbitrage Opportunities' section. High density, sticky headers.",
+    "7. WALLET: Mock the MetaMask connection if actual web3 integration is out of scope, but UI must show 'Connected' state with address truncation.",
+    "8. NOTIFICATIONS: Use 'sonner' for all trade confirmations and error messages.",
+    "9. ANIMATION: Add subtle entrance animations using framer-motion (fade-in-up) for dashboard cards."
+  ],
+  "universal_guidelines": [
+    "DO NOT use gradients for text.",
+    "DO NOT use pure black (#000000) for backgrounds; use #050505.",
+    "Ensure all interactive elements have hover states.",
+    "Use 'data-testid' for all key interactions."
+  ]
+}
