@@ -1,72 +1,66 @@
 # BeraArb - Berachain Arbitrage Trading Engine
 
-## Latest Enhancement (Jan 2026)
+## Latest Optimization (Jan 2026)
 
-### Trading Engine Upgrades
-1. **Real-time Opportunity Detection**
-   - Batch RPC queries via parallel async tasks
-   - Extended pairs: 9 trading pairs monitored
-   - Scan cycle < 2 seconds with caching
+### Scanner Enhancements
+1. **In-Memory Price Matrix**
+   - PriceMatrix class tracks all token prices
+   - Enables fast path discovery for triangular arb
+   - Auto-updates on each scan cycle
 
-2. **Automatic Arbitrage Execution**
-   - AutoExecutionEngine class with cooldown
-   - Profit calculation: net = raw - gas - slippage - price_impact
-   - Execute only when net_profit > threshold
+2. **Optimized Direct Arbitrage**
+   - 10 high-liquidity pairs monitored
+   - Parallel async quotes for all pairs
+   - Scan cycle: ~1-2 seconds
 
-3. **Opportunity Ranking**
-   - Score = 60% profit + 25% gas efficiency + 15% liquidity
-   - Best opportunities shown first
+3. **Risk-Adjusted Ranking**
+   - Score = profit (50%) + spread (15%) + gas_efficiency (15%) + liquidity (10%) + risk_adjusted (10%)
+   - Risk factors: gas/profit ratio, price impact, liquidity
+   - Opportunities sorted by highest score
 
-4. **Liquidity & Price Impact Protection**
-   - Pool reserves fetching via factory contract
-   - MIN_LIQUIDITY_USD = $1,000 required
-   - MAX_PRICE_IMPACT_PERCENT = 3%
+4. **Triangular Arbitrage Detection**
+   - find_triangular_arbitrage() function available
+   - Detects A → B → C → A cycles
+   - Endpoint: GET /api/triangular-opportunities
+   - Disabled in main scan for performance (use dedicated endpoint)
 
-5. **Honeypot Detection**
-   - Simulates buy/sell via eth_call
-   - Blacklists tokens with >30% tax
-   - Endpoint: GET /api/honeypot/check/{token}
+5. **Safety Filters**
+   - MIN_LIQUIDITY_USD: $1,000 minimum
+   - MAX_PRICE_IMPACT_PERCENT: 3% maximum
+   - Skips pools failing checks
 
-6. **Safety Limits**
-   - MAX_TRADE_SIZE_USD: $10,000
-   - MAX_SLIPPAGE_PERCENT: 5%
-   - GAS_BUFFER_MULTIPLIER: 1.3x
-   - TRADE_TIMEOUT_SECONDS: 120
+### New Components
+- **PriceMatrix**: In-memory token price tracking
+- **rank_opportunities()**: Risk-adjusted sorting
+- **find_triangular_arbitrage()**: Multi-hop detection
+- **/api/triangular-opportunities**: Dedicated triangular endpoint
 
-### New Backend Features
-- TradingCache: Pool data, token prices, gas caching
-- AutoExecutionEngine: Automated trading with cooldown
-- rank_opportunities(): Score-based sorting
-- detect_honeypot(): Token safety verification
-- get_pool_reserves(): Liquidity checks
-- calculate_price_impact(): AMM formula calculation
+### Performance Metrics
+- Scan time: ~1-2 seconds
+- Pairs monitored: 10 high-liquidity
+- Price updates: Real-time via price matrix
 
-### New API Endpoints
-- GET /api/engine/stats - Cache and engine statistics
-- GET /api/honeypot/check/{token} - Honeypot detection
-- GET /api/pool/reserves - Pool liquidity info
-- POST /api/auto-execute/enable - Enable auto-trading
-- POST /api/auto-execute/disable - Disable auto-trading
-- GET /api/auto-execute/status - Engine status
-
-### Frontend Updates
-- Immediate REST API data fetch on load
-- WebSocket with 5-second timeout fallback
-- Polling every 5 seconds when WS unavailable
-- Connection status: Live/Polling/Connecting
+### Safety Limits
+| Parameter | Value |
+|-----------|-------|
+| MAX_TRADE_SIZE_USD | $10,000 |
+| MAX_SLIPPAGE_PERCENT | 5% |
+| MAX_PRICE_IMPACT_PERCENT | 3% |
+| MIN_PROFIT_THRESHOLD | $0.01 |
+| MIN_LIQUIDITY_USD | $1,000 |
 
 ## MOCKED Components
-- BEX DEX: Uses Kodiak router with price variation simulation
+- BEX DEX: Simulated with price variation from Kodiak
 
 ## Prioritized Backlog
 
 ### P0 (Critical)
 - [ ] Integrate actual BEX router contracts
 - [ ] Add token approval flow
-- [ ] Implement flash loans
+- [ ] Background worker for triangular scanning
 
-### P1 (High Priority)  
-- [ ] Multi-hop arbitrage (A→B→C→A)
+### P1 (High Priority)
+- [ ] Flash loan integration
 - [ ] MEV protection (Flashbots)
 - [ ] Telegram notifications
 

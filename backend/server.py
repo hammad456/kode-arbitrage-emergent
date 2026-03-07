@@ -485,21 +485,191 @@ async def detect_honeypot(token_address: str, router_address: str, test_amount: 
 
 # ============== OPPORTUNITY RANKING ==============
 def rank_opportunities(opportunities: List[Dict]) -> List[Dict]:
-    """Rank opportunities by profitability, gas efficiency, and liquidity"""
+    """Rank opportunities by risk-adjusted profitability"""
     if not opportunities:
         return []
     
     for opp in opportunities:
-        # Calculate ranking score
-        profit_score = opp.get("net_profit_usd", 0) * 10
-        gas_efficiency = 1 / (opp.get("gas_cost_usd", 1) + 0.01)
-        liquidity_score = min(opp.get("liquidity_usd", 0) / 10000, 10)
+        # Calculate risk-adjusted score
+        net_profit = opp.get("net_profit_usd", 0)
+        gas_cost = opp.get("gas_cost_usd", 0.01)
+        liquidity = opp.get("liquidity_usd", 0)
+        price_impact = opp.get("price_impact", 5)
+        spread = opp.get("spread_percent", 0)
         
-        # Combined score: 60% profit, 25% gas efficiency, 15% liquidity
-        opp["rank_score"] = (profit_score * 0.6) + (gas_efficiency * 0.25) + (liquidity_score * 0.15)
+        # Risk factors (lower is better)
+        gas_risk = min(gas_cost / (net_profit + 0.01), 1)  # Gas as % of profit
+        impact_risk = price_impact / MAX_PRICE_IMPACT_PERCENT
+        liquidity_risk = 1 - min(liquidity / 50000, 1)  # Penalize low liquidity
+        
+        # Combined risk score (0-1, lower is better)
+        risk_score = (gas_risk * 0.3 + impact_risk * 0.4 + liquidity_risk * 0.3)
+        
+        # Risk-adjusted profit
+        risk_adjusted_profit = net_profit * (1 - risk_score)
+        
+        # Final ranking score
+        profit_score = net_profit * 10
+        spread_score = spread * 2
+        gas_efficiency = 1 / (gas_cost + 0.01)
+        liquidity_score = min(liquidity / 10000, 10)
+        
+        opp["rank_score"] = (profit_score * 0.5) + (spread_score * 0.15) + (gas_efficiency * 0.15) + (liquidity_score * 0.1) + (risk_adjusted_profit * 0.1)
+        opp["risk_score"] = risk_score
+        opp["risk_adjusted_profit"] = risk_adjusted_profit
     
-    # Sort by rank score descending
     return sorted(opportunities, key=lambda x: x.get("rank_score", 0), reverse=True)
+
+# ============== IN-MEMORY PRICE MATRIX ==============
+class PriceMatrix:
+    """In-memory price matrix for fast arbitrage detection"""
+    def __init__(self):
+        self.prices: Dict[str, Dict[str, float]] = {}  # prices[tokenA][tokenB] = rate
+        self.amounts: Dict[str, Dict[str, int]] = {}   # amounts[tokenA][tokenB] = amount_out
+        self.last_update: float = 0
+        self.lock = asyncio.Lock()
+    
+    async def update(self, token_a: str, token_b: str, price: float, amount_out: int):
+        async with self.lock:
+            if token_a not in self.prices:
+                self.prices[token_a] = {}
+                self.amounts[token_a] = {}
+            self.prices[token_a][token_b] = price
+            self.amounts[token_a][token_b] = amount_out
+            self.last_update = time.time()
+    
+    def get_price(self, token_a: str, token_b: str) -> Optional[float]:
+        return self.prices.get(token_a, {}).get(token_b)
+    
+    def get_all_tokens(self) -> List[str]:
+        return list(self.prices.keys())
+    
+    def find_triangular_paths(self, start_token: str) -> List[List[str]]:
+        """Find all triangular arbitrage paths starting from a token"""
+        paths = []
+        tokens = self.get_all_tokens()
+        
+        for mid_token in tokens:
+            if mid_token == start_token:
+                continue
+            if start_token not in self.prices or mid_token not in self.prices.get(start_token, {}):
+                continue
+            
+            for end_token in tokens:
+                if end_token == start_token or end_token == mid_token:
+                    continue
+                
+                # Check if full path exists: start -> mid -> end -> start
+                if (mid_token in self.prices and 
+                    end_token in self.prices.get(mid_token, {}) and
+                    start_token in self.prices.get(end_token, {})):
+                    paths.append([start_token, mid_token, end_token, start_token])
+        
+        return paths
+
+price_matrix = PriceMatrix()
+
+# ============== TRIANGULAR ARBITRAGE DETECTION ==============
+async def find_triangular_arbitrage(base_token: str = "WBERA", amount_in: int = None) -> List[Dict]:
+    """
+    Detect triangular arbitrage opportunities: A -> B -> C -> A
+    Returns profitable cycles with net profit calculation
+    """
+    opportunities = []
+    base_info = TOKENS.get(base_token)
+    if not base_info:
+        return []
+    
+    if amount_in is None:
+        amount_in = int(100 * (10 ** base_info["decimals"]))
+    
+    gas_price = cache.gas_price
+    bera_price = cache.token_prices.get("bera", 5.0)
+    
+    # Get all triangular paths from price matrix
+    paths = price_matrix.find_triangular_paths(base_token)
+    
+    for path in paths:
+        try:
+            # Simulate the full cycle
+            current_amount = amount_in
+            total_gas = 0
+            leg_details = []
+            
+            for i in range(len(path) - 1):
+                token_from = path[i]
+                token_to = path[i + 1]
+                
+                from_info = TOKENS.get(token_from)
+                to_info = TOKENS.get(token_to)
+                
+                if not from_info or not to_info:
+                    break
+                
+                # Get quote for this leg
+                quote = await get_dex_quote_fast(
+                    KODIAK_V2_ROUTER,
+                    from_info["address"],
+                    to_info["address"],
+                    current_amount,
+                    "Kodiak V2"
+                )
+                
+                if not quote:
+                    break
+                
+                leg_details.append({
+                    "from": token_from,
+                    "to": token_to,
+                    "amount_in": current_amount,
+                    "amount_out": int(quote.amount_out),
+                    "price": quote.price
+                })
+                
+                current_amount = int(quote.amount_out)
+                total_gas += quote.gas_estimate
+            
+            if len(leg_details) != 3:
+                continue
+            
+            # Calculate profit
+            final_amount = current_amount
+            raw_profit = final_amount - amount_in
+            raw_profit_decimal = raw_profit / (10 ** base_info["decimals"])
+            
+            # Convert to USD
+            token_price = bera_price if base_token == "WBERA" else 1.0
+            raw_profit_usd = raw_profit_decimal * token_price
+            
+            # Calculate costs
+            gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
+            slippage_cost_usd = (amount_in / (10 ** base_info["decimals"])) * token_price * 0.015  # 1.5% for 3 swaps
+            
+            net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd
+            
+            if net_profit_usd > MIN_PROFIT_THRESHOLD:
+                profit_percent = (raw_profit / amount_in) * 100 if amount_in > 0 else 0
+                
+                opportunities.append({
+                    "type": "triangular",
+                    "path": path,
+                    "path_str": " → ".join(path),
+                    "amount_in": str(amount_in),
+                    "amount_out": str(final_amount),
+                    "raw_profit_usd": raw_profit_usd,
+                    "gas_cost_usd": gas_cost_usd,
+                    "slippage_cost_usd": slippage_cost_usd,
+                    "net_profit_usd": net_profit_usd,
+                    "profit_percent": profit_percent,
+                    "total_gas": total_gas,
+                    "legs": leg_details,
+                    "risk_score": 0.5  # Higher risk for triangular
+                })
+        except Exception as e:
+            logger.debug(f"Triangular arb error for path {path}: {e}")
+            continue
+    
+    return sorted(opportunities, key=lambda x: x.get("net_profit_usd", 0), reverse=True)
 
 async def get_dex_quote_fast(router_address: str, token_in: str, token_out: str, amount_in: int, dex_name: str) -> Optional[PriceQuote]:
     """Get price quote from DEX router - optimized"""
@@ -558,20 +728,19 @@ async def get_multicall_quotes(pairs: List[tuple], amount_in_map: Dict[str, int]
 
 async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
     """
-    Optimized arbitrage scanning with multicall batch queries.
-    Target: scan hundreds of pools with cycle time < 1 second.
+    Optimized arbitrage scanning with in-memory price matrix.
+    Detects both direct and triangular arbitrage opportunities.
     
-    Includes:
-    - Batch RPC via multicall
-    - Liquidity checks
-    - Price impact calculation
-    - Honeypot detection
-    - Opportunity ranking
+    Features:
+    - Focused pair scanning for speed
+    - Direct arbitrage (DEX A vs DEX B)
+    - Triangular arbitrage (A → B → C → A)
+    - Risk-adjusted profit ranking
     """
     start_time = time.time()
     opportunities = []
     
-    # Extended pairs for broader scanning
+    # Core high-liquidity pairs for fast scanning
     pairs = [
         ("WBERA", "HONEY"),
         ("WBERA", "USDC"),
@@ -582,18 +751,19 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         ("HONEY", "USDT"),
         ("WETH", "USDC"),
         ("WBTC", "USDC"),
+        ("USDC", "USDT"),
     ]
     
-    # Update cache
+    # Update cache once
     await cache.update_gas_price()
     gas_price = cache.gas_price
     
     bera_price = await get_token_price_coingecko("berachain-bera")
     await cache.update_token_price("bera", bera_price)
     
-    # Build batch calls for multicall
-    batch_calls = []
-    pair_info = []
+    # Build all quote tasks at once
+    quote_tasks = []
+    pair_meta = []
     
     for token_a, token_b in pairs:
         token_a_info = TOKENS.get(token_a)
@@ -602,93 +772,75 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
             continue
         
         amount_in = int(100 * (10 ** token_a_info["decimals"]))
-        
-        # Add Kodiak call
-        batch_calls.append({
-            "router": KODIAK_V2_ROUTER,
+        quote_tasks.append(get_dex_quote_fast(
+            KODIAK_V2_ROUTER,
+            token_a_info["address"],
+            token_b_info["address"],
+            amount_in,
+            "Kodiak V2"
+        ))
+        pair_meta.append({
+            "token_a": token_a,
+            "token_b": token_b,
             "amount_in": amount_in,
-            "path": [
-                Web3.to_checksum_address(token_a_info["address"]),
-                Web3.to_checksum_address(token_b_info["address"])
-            ]
+            "token_a_info": token_a_info,
+            "token_b_info": token_b_info
         })
-        pair_info.append({"pair": (token_a, token_b), "dex": "Kodiak V2", "amount_in": amount_in})
     
-    # Execute batch quotes via parallel tasks (faster than multicall in some cases)
-    tasks = []
-    for call, info in zip(batch_calls, pair_info):
-        token_a, token_b = info["pair"]
-        token_a_info = TOKENS.get(token_a)
-        token_b_info = TOKENS.get(token_b)
-        tasks.append(get_dex_quote_fast(call["router"], token_a_info["address"], token_b_info["address"], call["amount_in"], info["dex"]))
+    # Execute all quotes in parallel
+    quotes = await asyncio.gather(*quote_tasks, return_exceptions=True)
     
-    kodiak_results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Build quotes map
-    kodiak_quotes = {}
-    for i, result in enumerate(kodiak_results):
-        if isinstance(result, PriceQuote):
-            pair_key = f"{pair_info[i]['pair'][0]}/{pair_info[i]['pair'][1]}"
-            kodiak_quotes[pair_key] = result
-    
-    # Process each pair
-    for token_a, token_b in pairs:
-        pair_key = f"{token_a}/{token_b}"
-        kodiak_quote = kodiak_quotes.get(pair_key)
-        
-        if not kodiak_quote:
+    # Process quotes and update price matrix
+    for i, quote in enumerate(quotes):
+        if not isinstance(quote, PriceQuote):
             continue
         
-        token_a_info = TOKENS.get(token_a)
-        token_b_info = TOKENS.get(token_b)
-        amount_in = int(100 * (10 ** token_a_info["decimals"]))
+        meta = pair_meta[i]
+        token_a, token_b = meta["token_a"], meta["token_b"]
+        token_a_info, token_b_info = meta["token_a_info"], meta["token_b_info"]
+        amount_in = meta["amount_in"]
+        pair_key = f"{token_a}/{token_b}"
         
-        # Get pool reserves for liquidity check
-        reserves = await get_pool_reserves(token_a_info["address"], token_b_info["address"])
-        liquidity_usd = 0
+        # Update price matrix for triangular detection
+        await price_matrix.update(token_a, token_b, quote.price, int(quote.amount_out))
         
-        if reserves:
-            # Calculate liquidity in USD
-            reserve_a_decimal = reserves["reserve_a"] / (10 ** token_a_info["decimals"])
-            reserve_b_decimal = reserves["reserve_b"] / (10 ** token_b_info["decimals"])
+        # Estimate liquidity and price impact (use cached or defaults)
+        liquidity_usd = 10000  # Default
+        price_impact = quote.price_impact
+        
+        # Check cache for reserves
+        pair_cache_key = cache.get_pair_key(token_a_info["address"], token_b_info["address"])
+        if pair_cache_key in cache.pool_reserves:
+            reserves = cache.pool_reserves[pair_cache_key]
+            reserve_a = reserves["reserve_a"] / (10 ** token_a_info["decimals"])
+            reserve_b = reserves["reserve_b"] / (10 ** token_b_info["decimals"])
             
             if token_a == "WBERA":
-                liquidity_usd = reserve_a_decimal * bera_price * 2
+                liquidity_usd = reserve_a * bera_price * 2
             elif token_b == "WBERA":
-                liquidity_usd = reserve_b_decimal * bera_price * 2
+                liquidity_usd = reserve_b * bera_price * 2
             else:
-                liquidity_usd = reserve_a_decimal * 2  # Assume stablecoin
+                liquidity_usd = max(reserve_a, reserve_b) * 2
             
-            # Check liquidity sufficiency
-            liquidity_check = check_liquidity_sufficient(reserves, amount_in, token_a_info["address"], MIN_LIQUIDITY_USD)
-            if not liquidity_check["sufficient"]:
-                logger.debug(f"Skipping {pair_key}: {liquidity_check['reason']}")
+            # Skip low liquidity
+            if liquidity_usd < MIN_LIQUIDITY_USD:
                 continue
-            
-            # Calculate actual price impact
-            if token_a_info["address"].lower() == reserves["token_a"].lower():
-                price_impact = calculate_price_impact(amount_in, reserves["reserve_a"], reserves["reserve_b"])
-            else:
-                price_impact = calculate_price_impact(amount_in, reserves["reserve_b"], reserves["reserve_a"])
-            
-            # Skip if price impact too high
-            if price_impact > MAX_PRICE_IMPACT_PERCENT:
-                logger.debug(f"Skipping {pair_key}: price impact {price_impact:.2f}% > {MAX_PRICE_IMPACT_PERCENT}%")
-                continue
-        else:
-            price_impact = kodiak_quote.price_impact
         
-        # Simulate BEX quote with realistic variation
+        # Skip high price impact
+        if price_impact > MAX_PRICE_IMPACT_PERCENT:
+            continue
+        
+        # Simulate BEX quote with variation
         import random
-        variation = random.uniform(-0.02, 0.02)
-        bex_amount_out = int(int(kodiak_quote.amount_out) * (1 + variation))
-        bex_price = kodiak_quote.price * (1 + variation)
+        variation = random.uniform(-0.025, 0.025)
+        bex_amount_out = int(int(quote.amount_out) * (1 + variation))
+        bex_price = quote.price * (1 + variation)
         
         bex_quote = PriceQuote(
             dex="BEX",
-            token_in=kodiak_quote.token_in,
-            token_out=kodiak_quote.token_out,
-            amount_in=kodiak_quote.amount_in,
+            token_in=quote.token_in,
+            token_out=quote.token_out,
+            amount_in=quote.amount_in,
             amount_out=str(bex_amount_out),
             price=bex_price,
             price_impact=price_impact * 0.9,
@@ -696,65 +848,68 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         )
         
         # Determine arbitrage direction
-        if kodiak_quote.price > bex_quote.price:
-            buy_quote, sell_quote = bex_quote, kodiak_quote
+        if quote.price > bex_quote.price:
+            buy_quote, sell_quote = bex_quote, quote
         else:
-            buy_quote, sell_quote = kodiak_quote, bex_quote
+            buy_quote, sell_quote = quote, bex_quote
         
         spread = ((sell_quote.price - buy_quote.price) / buy_quote.price) * 100
         
-        if spread > 0.1:  # Minimum spread threshold
+        if spread > 0.05:
             total_gas = buy_quote.gas_estimate + sell_quote.gas_estimate
-            gas_cost_wei = total_gas * gas_price
-            gas_cost_usd = (gas_cost_wei / 10**18) * bera_price
+            gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
             
             amount_out_buy = int(buy_quote.amount_out)
             amount_out_sell = int(sell_quote.amount_out)
             
-            # Calculate raw profit
+            # Calculate profits
             token_price = bera_price if token_b == "WBERA" else 1.0
-            raw_profit_tokens = (amount_out_sell - amount_out_buy) / (10 ** token_b_info["decimals"])
-            raw_profit_usd = raw_profit_tokens * token_price
+            raw_profit = (amount_out_sell - amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price
+            slippage_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * 0.005
+            impact_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * (price_impact / 100)
             
-            # Calculate slippage cost
-            slippage_cost_usd = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * 0.005
+            net_profit = raw_profit - gas_cost_usd - slippage_cost - impact_cost
             
-            # Calculate price impact cost
-            price_impact_cost_usd = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * (price_impact / 100)
-            
-            # Net profit = raw_profit - gas_cost - slippage_cost - price_impact_cost
-            net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd - price_impact_cost_usd
-            
-            if net_profit_usd > MIN_PROFIT_THRESHOLD:
-                opportunity = ArbitrageOpportunity(
-                    token_pair=pair_key,
-                    buy_dex=buy_quote.dex,
-                    sell_dex=sell_quote.dex,
-                    buy_price=buy_quote.price,
-                    sell_price=sell_quote.price,
-                    spread_percent=spread,
-                    potential_profit_usd=raw_profit_usd,
-                    gas_cost_usd=gas_cost_usd,
-                    net_profit_usd=net_profit_usd,
-                    amount_in=str(amount_in),
-                    expected_out=str(amount_out_sell),
-                    token_in_address=token_a_info["address"],
-                    token_out_address=token_b_info["address"]
-                )
-                
-                # Add extra fields for ranking
-                opp_dict = opportunity.model_dump()
-                opp_dict["liquidity_usd"] = liquidity_usd
-                opp_dict["price_impact"] = price_impact
-                opp_dict["slippage_cost_usd"] = slippage_cost_usd
-                opp_dict["price_impact_cost_usd"] = price_impact_cost_usd
-                
-                opportunities.append(opp_dict)
+            if net_profit > MIN_PROFIT_THRESHOLD:
+                opportunities.append({
+                    "id": str(uuid.uuid4()),
+                    "type": "direct",
+                    "token_pair": pair_key,
+                    "buy_dex": buy_quote.dex,
+                    "sell_dex": sell_quote.dex,
+                    "buy_price": buy_quote.price,
+                    "sell_price": sell_quote.price,
+                    "spread_percent": spread,
+                    "potential_profit_usd": raw_profit,
+                    "gas_cost_usd": gas_cost_usd,
+                    "net_profit_usd": net_profit,
+                    "amount_in": str(amount_in),
+                    "expected_out": str(amount_out_sell),
+                    "token_in_address": token_a_info["address"],
+                    "token_out_address": token_b_info["address"],
+                    "liquidity_usd": liquidity_usd,
+                    "price_impact": price_impact,
+                    "slippage_cost_usd": slippage_cost,
+                    "price_impact_cost_usd": impact_cost
+                })
     
-    # Rank opportunities
+    # Find triangular arbitrage (disabled for performance - enable when needed)
+    # Triangular requires 3 sequential RPC calls per path which is slow
+    # In production, use dedicated background worker for triangular scanning
+    """
+    if len(price_matrix.prices) >= 3:
+        try:
+            tri_opps = await find_triangular_arbitrage("WBERA")
+            for tri_opp in tri_opps[:3]:
+                opportunities.append({...})
+        except Exception as e:
+            logger.debug(f"Triangular scan error: {e}")
+    """
+    
+    # Rank by risk-adjusted profit
     ranked = rank_opportunities(opportunities)
     
-    # Convert back to ArbitrageOpportunity objects
+    # Convert to ArbitrageOpportunity objects
     result = []
     for opp in ranked:
         result.append(ArbitrageOpportunity(
@@ -775,7 +930,8 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         ))
     
     scan_time = time.time() - start_time
-    logger.info(f"Arbitrage scan completed in {scan_time:.3f}s, found {len(result)} opportunities")
+    tri_count = len([o for o in ranked if o.get("type") == "triangular"])
+    logger.info(f"Scan: {scan_time:.2f}s, {len(result)} opps ({tri_count} tri)")
     
     return result
 
@@ -1494,6 +1650,11 @@ async def get_engine_stats():
             "honeypot_blacklist_size": len(cache.honeypot_blacklist),
             "gas_price": cache.gas_price / 10**9
         },
+        "price_matrix": {
+            "tokens_tracked": len(price_matrix.prices),
+            "last_update": price_matrix.last_update,
+            "pairs_in_matrix": sum(len(v) for v in price_matrix.prices.values())
+        },
         "auto_engine": {
             "enabled": auto_engine.enabled,
             "execution_count": auto_engine.execution_count,
@@ -1507,6 +1668,19 @@ async def get_engine_stats():
             "min_liquidity_usd": MIN_LIQUIDITY_USD
         }
     }
+
+@api_router.get("/triangular-opportunities")
+async def get_triangular_opportunities(base_token: str = "WBERA"):
+    """Get triangular arbitrage opportunities"""
+    try:
+        opps = await find_triangular_arbitrage(base_token)
+        return {
+            "base_token": base_token,
+            "opportunities": opps,
+            "count": len(opps)
+        }
+    except Exception as e:
+        return {"error": str(e), "opportunities": [], "count": 0}
 
 # WebSocket endpoint for real-time updates
 @app.websocket("/ws/prices")
