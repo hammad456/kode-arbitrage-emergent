@@ -32,18 +32,26 @@ CHAIN_ID = 80094
 # Initialize Web3
 w3 = Web3(Web3.HTTPProvider(BERACHAIN_RPC))
 
-# Safety limits
+# Safety limits - Production ready (Micro-Arbitrage Optimized)
 MAX_TRADE_SIZE_USD = 10000
 MAX_GAS_LIMIT = 500000
 TRADE_TIMEOUT_SECONDS = 120
-MIN_PROFIT_THRESHOLD = 0.01
+MIN_PROFIT_THRESHOLD = 0.0005  # $0.0005 minimum for micro-arb
+MIN_SPREAD_THRESHOLD = 0.05   # 0.05% spread threshold (micro-arbitrage)
 MAX_SLIPPAGE_PERCENT = 5.0
-PRICE_CHANGE_TOLERANCE = 2.0  # Abort if price changed more than 2%
-GAS_BUFFER_MULTIPLIER = 1.3  # Add 30% buffer to gas estimates
-MAX_PRICE_IMPACT_PERCENT = 3.0  # Max acceptable price impact
-MIN_LIQUIDITY_USD = 1000  # Minimum pool liquidity required
+PRICE_CHANGE_TOLERANCE = 2.0
+GAS_BUFFER_MULTIPLIER = 1.3
+MAX_PRICE_IMPACT_PERCENT = 3.0
+MIN_LIQUIDITY_USD = 200  # Lower threshold for micro-arb
 HONEYPOT_CHECK_ENABLED = True
-AUTO_EXECUTE_ENABLED = False  # Set via settings
+AUTO_EXECUTE_ENABLED = False
+
+# Multi-hop arbitrage config
+MAX_HOP_COUNT = 4  # Max tokens in multi-hop route
+MULTI_HOP_GAS_PER_SWAP = 150000
+
+# Logging config
+ARB_LOG_ENABLED = True
 
 # DEX Contract Addresses (Berachain Mainnet)
 KODIAK_V3_ROUTER = "0xEd158C4b336A6FCb5B193A5570e3a571f6cbe690"
@@ -217,9 +225,118 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# ============== ENHANCED ARB LOGGER ==============
+class ArbLogger:
+    """Comprehensive logging and metrics for arbitrage operations"""
+    def __init__(self):
+        self.opportunities_found = 0
+        self.trades_skipped = 0
+        self.trades_executed = 0
+        self.trades_failed = 0
+        self.total_profit = 0.0
+        self.last_opportunities: List[Dict] = []
+        self.skip_reasons: Dict[str, int] = {}
+        self.profit_by_pair: Dict[str, float] = {}
+        self.scans_count = 0
+        self.scan_times: List[float] = []
+        self.micro_arbs_found = 0  # 0.05%-0.2% spread
+        self.triangular_found = 0
+        self.multi_hop_found = 0
+        self.simulations_passed = 0
+        self.simulations_failed = 0
+        self.last_scan_time = 0.0
+        self.start_time = time.time()
+    
+    def log_opportunity(self, opp: Dict):
+        if not ARB_LOG_ENABLED:
+            return
+        self.opportunities_found += 1
+        spread = opp.get('spread_percent', 0)
+        opp_type = opp.get('type', 'direct')
+        
+        # Track micro-arbitrage
+        if 0.05 <= spread <= 0.2:
+            self.micro_arbs_found += 1
+        
+        # Track by type
+        if opp_type == 'triangular':
+            self.triangular_found += 1
+        elif opp_type == 'multi_hop':
+            self.multi_hop_found += 1
+        
+        logger.info(f"[ARB] Found: {opp.get('token_pair')} | type={opp_type} | spread={spread:.3f}% | net=${opp.get('net_profit_usd', 0):.4f}")
+    
+    def log_skip(self, pair: str, reason: str):
+        if not ARB_LOG_ENABLED:
+            return
+        self.trades_skipped += 1
+        self.skip_reasons[reason] = self.skip_reasons.get(reason, 0) + 1
+        logger.debug(f"[ARB] Skip: {pair} | {reason}")
+    
+    def log_simulation(self, success: bool, reason: str = ""):
+        if success:
+            self.simulations_passed += 1
+        else:
+            self.simulations_failed += 1
+            logger.debug(f"[ARB] Simulation failed: {reason}")
+    
+    def log_execution(self, opp: Dict, success: bool, tx_hash: str = None, actual_profit: float = 0):
+        if not ARB_LOG_ENABLED:
+            return
+        
+        pair = opp.get('token_pair', 'UNKNOWN')
+        
+        if success:
+            self.trades_executed += 1
+            profit = actual_profit if actual_profit else opp.get("net_profit_usd", 0)
+            self.total_profit += profit
+            self.profit_by_pair[pair] = self.profit_by_pair.get(pair, 0) + profit
+            logger.info(f"[ARB] EXECUTED: {pair} | profit=${profit:.4f} | tx={tx_hash[:16] if tx_hash else 'N/A'}...")
+        else:
+            self.trades_failed += 1
+            logger.warning(f"[ARB] FAILED: {pair}")
+    
+    def log_scan(self, scan_time: float, opps_count: int):
+        self.scans_count += 1
+        self.last_scan_time = scan_time
+        self.scan_times.append(scan_time)
+        # Keep only last 100 scan times
+        if len(self.scan_times) > 100:
+            self.scan_times = self.scan_times[-100:]
+    
+    def get_stats(self) -> Dict:
+        uptime = time.time() - self.start_time
+        avg_scan = sum(self.scan_times) / len(self.scan_times) if self.scan_times else 0
+        
+        return {
+            "opportunities_found": self.opportunities_found,
+            "micro_arbs_found": self.micro_arbs_found,
+            "triangular_found": self.triangular_found,
+            "multi_hop_found": self.multi_hop_found,
+            "trades_skipped": self.trades_skipped,
+            "trades_executed": self.trades_executed,
+            "trades_failed": self.trades_failed,
+            "total_profit": round(self.total_profit, 4),
+            "profit_by_pair": self.profit_by_pair,
+            "skip_reasons": dict(sorted(self.skip_reasons.items(), key=lambda x: x[1], reverse=True)[:10]),
+            "simulations": {
+                "passed": self.simulations_passed,
+                "failed": self.simulations_failed,
+                "success_rate": round(self.simulations_passed / (self.simulations_passed + self.simulations_failed) * 100, 2) if (self.simulations_passed + self.simulations_failed) > 0 else 0
+            },
+            "scanning": {
+                "total_scans": self.scans_count,
+                "last_scan_time_ms": round(self.last_scan_time * 1000, 2),
+                "avg_scan_time_ms": round(avg_scan * 1000, 2),
+                "uptime_hours": round(uptime / 3600, 2)
+            }
+        }
+
+arb_logger = ArbLogger()
+
 # ============== ADVANCED CACHING SYSTEM ==============
 class TradingCache:
-    """High-performance cache for pool data and token info"""
+    """High-performance in-memory cache for maximum speed"""
     def __init__(self):
         self.pool_reserves: Dict[str, Dict] = {}
         self.token_prices: Dict[str, float] = {"bera": 5.0}
@@ -228,6 +345,7 @@ class TradingCache:
         self.token_metadata: Dict[str, Dict] = {}
         self.honeypot_blacklist: set = set()
         self.last_update: Dict[str, float] = {}
+        self.quotes_cache: Dict[str, Dict] = {}  # Cache recent quotes
         self.lock = asyncio.Lock()
     
     def is_stale(self, key: str, max_age: float = 5.0) -> bool:
@@ -247,6 +365,16 @@ class TradingCache:
     
     def get_pair_key(self, token_a: str, token_b: str) -> str:
         return f"{min(token_a, token_b)}_{max(token_a, token_b)}"
+    
+    def cache_quote(self, pair_key: str, quote_data: Dict):
+        self.quotes_cache[pair_key] = {**quote_data, "cached_at": time.time()}
+        self.last_update[f"quote_{pair_key}"] = time.time()
+    
+    def get_cached_quote(self, pair_key: str, max_age: float = 2.0) -> Optional[Dict]:
+        cached = self.quotes_cache.get(pair_key)
+        if cached and time.time() - cached.get("cached_at", 0) < max_age:
+            return cached
+        return None
 
 cache = TradingCache()
 
@@ -485,38 +613,69 @@ async def detect_honeypot(token_address: str, router_address: str, test_amount: 
 
 # ============== OPPORTUNITY RANKING ==============
 def rank_opportunities(opportunities: List[Dict]) -> List[Dict]:
-    """Rank opportunities by risk-adjusted profitability"""
+    """
+    Advanced risk-adjusted ranking for opportunities.
+    Optimized for micro-arbitrage (0.05-0.2% spreads).
+    
+    Scoring weights:
+    - Net profit (35%): Higher is better
+    - Risk score (25%): Lower is better (gas/profit ratio, price impact)
+    - Liquidity (20%): Higher is better
+    - Spread quality (10%): Optimal range 0.1-1%
+    - Execution probability (10%): Based on pool stability
+    """
     if not opportunities:
         return []
     
+    # Get max values for normalization
+    max_profit = max(o.get("net_profit_usd", 0) for o in opportunities) or 0.001
+    max_liquidity = max(o.get("liquidity_usd", 1) for o in opportunities) or 1
+    
     for opp in opportunities:
-        # Calculate risk-adjusted score
         net_profit = opp.get("net_profit_usd", 0)
-        gas_cost = opp.get("gas_cost_usd", 0.01)
-        liquidity = opp.get("liquidity_usd", 0)
+        liquidity = opp.get("liquidity_usd", 1)
         price_impact = opp.get("price_impact", 5)
         spread = opp.get("spread_percent", 0)
+        gas_cost = opp.get("gas_cost_usd", 0.01)
+        opp_type = opp.get("type", "direct")
         
-        # Risk factors (lower is better)
-        gas_risk = min(gas_cost / (net_profit + 0.01), 1)  # Gas as % of profit
-        impact_risk = price_impact / MAX_PRICE_IMPACT_PERCENT
-        liquidity_risk = 1 - min(liquidity / 50000, 1)  # Penalize low liquidity
+        # 1. Profit score (normalized 0-1)
+        profit_norm = min(net_profit / max_profit, 1) if max_profit > 0 else 0
         
-        # Combined risk score (0-1, lower is better)
-        risk_score = (gas_risk * 0.3 + impact_risk * 0.4 + liquidity_risk * 0.3)
+        # 2. Risk score (lower is better, so invert for ranking)
+        gas_risk = min(gas_cost / (net_profit + 0.0001), 1)  # Gas as % of profit
+        impact_risk = min(price_impact / MAX_PRICE_IMPACT_PERCENT, 1)
+        type_risk = 0.1 if opp_type == "direct" else 0.3 if opp_type == "triangular" else 0.5
+        risk_score = (gas_risk * 0.4) + (impact_risk * 0.4) + (type_risk * 0.2)
+        risk_norm = 1 - risk_score  # Invert: lower risk = higher score
         
-        # Risk-adjusted profit
-        risk_adjusted_profit = net_profit * (1 - risk_score)
+        # 3. Liquidity score (normalized 0-1)
+        liquidity_norm = min(liquidity / max_liquidity, 1)
         
-        # Final ranking score
-        profit_score = net_profit * 10
-        spread_score = spread * 2
-        gas_efficiency = 1 / (gas_cost + 0.01)
-        liquidity_score = min(liquidity / 10000, 10)
+        # 4. Spread quality score (optimal: 0.1-1%, penalize extremes)
+        if 0.1 <= spread <= 1.0:
+            spread_score = 1.0
+        elif spread < 0.1:
+            spread_score = spread / 0.1  # Linear ramp up
+        else:
+            spread_score = max(0, 1 - (spread - 1) / 5)  # Penalize high spreads
         
-        opp["rank_score"] = (profit_score * 0.5) + (spread_score * 0.15) + (gas_efficiency * 0.15) + (liquidity_score * 0.1) + (risk_adjusted_profit * 0.1)
-        opp["risk_score"] = risk_score
-        opp["risk_adjusted_profit"] = risk_adjusted_profit
+        # 5. Execution probability (simple heuristic)
+        exec_prob = 0.9 if opp_type == "direct" else 0.7 if opp_type == "triangular" else 0.5
+        
+        # Final ranking score (weighted sum)
+        opp["rank_score"] = (
+            (profit_norm * 0.35) +
+            (risk_norm * 0.25) +
+            (liquidity_norm * 0.20) +
+            (spread_score * 0.10) +
+            (exec_prob * 0.10)
+        )
+        
+        # Store individual metrics for display
+        opp["risk_score"] = round(risk_score, 4)
+        opp["risk_adjusted_profit"] = round(net_profit * (1 - risk_score), 4)
+        opp["execution_probability"] = round(exec_prob * 100, 1)
     
     return sorted(opportunities, key=lambda x: x.get("rank_score", 0), reverse=True)
 
@@ -566,8 +725,134 @@ class PriceMatrix:
                     paths.append([start_token, mid_token, end_token, start_token])
         
         return paths
+    
+    def find_multi_hop_paths(self, start_token: str, max_hops: int = 4) -> List[List[str]]:
+        """
+        Find multi-hop arbitrage paths (4+ tokens) using DFS.
+        Path: start -> A -> B -> C -> ... -> start
+        """
+        paths = []
+        tokens = self.get_all_tokens()
+        
+        def dfs(current: str, path: List[str], visited: set):
+            if len(path) > max_hops:
+                return
+            
+            # Check if we can return to start
+            if len(path) >= 3 and start_token in self.prices.get(current, {}):
+                paths.append(path + [start_token])
+            
+            # Continue exploring
+            for next_token in tokens:
+                if next_token in visited or next_token == start_token:
+                    continue
+                if next_token in self.prices.get(current, {}):
+                    dfs(next_token, path + [next_token], visited | {next_token})
+        
+        # Start DFS from each neighbor of start_token
+        for first_hop in tokens:
+            if first_hop != start_token and first_hop in self.prices.get(start_token, {}):
+                dfs(first_hop, [start_token, first_hop], {first_hop})
+        
+        return paths
+    
+    def calculate_path_profit(self, path: List[str]) -> Optional[float]:
+        """Calculate theoretical profit for a given path using cached prices"""
+        if len(path) < 3:
+            return None
+        
+        # Start with 1 unit, multiply through path
+        current_value = 1.0
+        for i in range(len(path) - 1):
+            price = self.get_price(path[i], path[i + 1])
+            if price is None or price == 0:
+                return None
+            current_value *= price
+        
+        # Profit percentage: (final - initial) / initial * 100
+        return (current_value - 1) * 100
 
 price_matrix = PriceMatrix()
+
+# ============== ON-CHAIN SIMULATION ==============
+async def simulate_swap_onchain(router: str, amount_in: int, path: List[str]) -> Optional[int]:
+    """
+    Simulate swap using eth_call to verify profit exists before execution.
+    Returns expected output amount or None if simulation fails.
+    """
+    try:
+        router_contract = w3.eth.contract(address=Web3.to_checksum_address(router), abi=ROUTER_V2_ABI)
+        checksummed_path = [Web3.to_checksum_address(addr) for addr in path]
+        
+        # Use call() which simulates without state change
+        result = router_contract.functions.getAmountsOut(amount_in, checksummed_path).call()
+        return result[-1] if result else None
+    except Exception as e:
+        logger.debug(f"Simulation failed: {e}")
+        return None
+
+async def verify_profit_onchain(opp: Dict) -> Dict:
+    """
+    Verify arbitrage profit still exists using on-chain simulation.
+    Returns verification result with updated amounts.
+    """
+    try:
+        pair = opp.get("token_pair", "")
+        tokens = pair.split("/") if "/" in pair else pair.split(" → ")[:2]
+        
+        if len(tokens) < 2:
+            return {"valid": False, "reason": "Invalid pair format"}
+        
+        token_in = TOKENS.get(tokens[0])
+        token_out = TOKENS.get(tokens[1])
+        
+        if not token_in or not token_out:
+            return {"valid": False, "reason": "Unknown tokens"}
+        
+        amount_in = int(opp.get("amount_in", 0))
+        if amount_in == 0:
+            return {"valid": False, "reason": "Invalid amount"}
+        
+        # Simulate buy
+        buy_path = [token_in["address"], token_out["address"]]
+        buy_output = await simulate_swap_onchain(KODIAK_V2_ROUTER, amount_in, buy_path)
+        
+        if not buy_output:
+            return {"valid": False, "reason": "Buy simulation failed"}
+        
+        # Simulate sell
+        sell_path = [token_out["address"], token_in["address"]]
+        sell_output = await simulate_swap_onchain(KODIAK_V2_ROUTER, buy_output, sell_path)
+        
+        if not sell_output:
+            return {"valid": False, "reason": "Sell simulation failed"}
+        
+        # Calculate actual profit
+        raw_profit = sell_output - amount_in
+        raw_profit_decimal = raw_profit / (10 ** token_in["decimals"])
+        
+        # Get current gas cost
+        gas_price = cache.gas_price
+        bera_price = cache.token_prices.get("bera", 5.0)
+        gas_cost_usd = (300000 * gas_price / 10**18) * bera_price
+        
+        token_price = bera_price if tokens[0] == "WBERA" else 1.0
+        net_profit_usd = (raw_profit_decimal * token_price) - gas_cost_usd
+        
+        # Safety: reject if final profit <= 0
+        if net_profit_usd <= 0:
+            arb_logger.log_skip(pair, f"Simulation shows loss: ${net_profit_usd:.4f}")
+            return {"valid": False, "reason": f"Profit <= 0 after simulation: ${net_profit_usd:.4f}"}
+        
+        return {
+            "valid": True,
+            "simulated_buy_output": buy_output,
+            "simulated_sell_output": sell_output,
+            "simulated_profit_usd": net_profit_usd,
+            "gas_cost_usd": gas_cost_usd
+        }
+    except Exception as e:
+        return {"valid": False, "reason": str(e)}
 
 # ============== TRIANGULAR ARBITRAGE DETECTION ==============
 async def find_triangular_arbitrage(base_token: str = "WBERA", amount_in: int = None) -> List[Dict]:
@@ -667,6 +952,133 @@ async def find_triangular_arbitrage(base_token: str = "WBERA", amount_in: int = 
                 })
         except Exception as e:
             logger.debug(f"Triangular arb error for path {path}: {e}")
+            continue
+    
+    return sorted(opportunities, key=lambda x: x.get("net_profit_usd", 0), reverse=True)
+
+async def find_multi_hop_arbitrage(base_token: str = "WBERA", amount_in: int = None, max_hops: int = 4) -> List[Dict]:
+    """
+    Detect multi-hop arbitrage opportunities: A -> B -> C -> D -> A
+    Returns profitable routes with 4+ tokens
+    """
+    opportunities = []
+    base_info = TOKENS.get(base_token)
+    if not base_info:
+        return []
+    
+    if amount_in is None:
+        amount_in = int(50 * (10 ** base_info["decimals"]))  # Smaller amount for multi-hop
+    
+    gas_price = cache.gas_price
+    bera_price = cache.token_prices.get("bera", 5.0)
+    
+    # Get multi-hop paths from price matrix (limit to avoid performance issues)
+    paths = price_matrix.find_multi_hop_paths(base_token, max_hops)[:20]
+    
+    for path in paths:
+        if len(path) <= 3:  # Skip triangular (handled separately)
+            continue
+        
+        try:
+            # Quick profit estimate using cached prices first
+            cached_profit = price_matrix.calculate_path_profit(path)
+            if cached_profit is None or cached_profit < MIN_SPREAD_THRESHOLD:
+                continue
+            
+            # Simulate the full cycle with actual quotes
+            current_amount = amount_in
+            total_gas = 0
+            leg_details = []
+            valid_path = True
+            
+            for i in range(len(path) - 1):
+                token_from = path[i]
+                token_to = path[i + 1]
+                
+                from_info = TOKENS.get(token_from)
+                to_info = TOKENS.get(token_to)
+                
+                if not from_info or not to_info:
+                    valid_path = False
+                    break
+                
+                # Get quote for this leg
+                quote = await get_dex_quote_fast(
+                    KODIAK_V2_ROUTER,
+                    from_info["address"],
+                    to_info["address"],
+                    current_amount,
+                    "Kodiak V2"
+                )
+                
+                if not quote:
+                    valid_path = False
+                    break
+                
+                leg_details.append({
+                    "from": token_from,
+                    "to": token_to,
+                    "amount_in": current_amount,
+                    "amount_out": int(quote.amount_out),
+                    "price": quote.price
+                })
+                
+                current_amount = int(quote.amount_out)
+                total_gas += MULTI_HOP_GAS_PER_SWAP
+            
+            if not valid_path or len(leg_details) != len(path) - 1:
+                continue
+            
+            # Calculate profit
+            final_amount = current_amount
+            raw_profit = final_amount - amount_in
+            raw_profit_decimal = raw_profit / (10 ** base_info["decimals"])
+            
+            # Convert to USD
+            token_price = bera_price if base_token == "WBERA" else 1.0
+            raw_profit_usd = raw_profit_decimal * token_price
+            
+            # Calculate costs (higher for multi-hop)
+            gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
+            slippage_per_hop = 0.005  # 0.5% per hop
+            slippage_cost_usd = (amount_in / (10 ** base_info["decimals"])) * token_price * slippage_per_hop * (len(path) - 1)
+            
+            net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd
+            
+            if net_profit_usd > MIN_PROFIT_THRESHOLD:
+                profit_percent = (raw_profit / amount_in) * 100 if amount_in > 0 else 0
+                
+                opportunities.append({
+                    "id": str(uuid.uuid4()),
+                    "type": "multi_hop",
+                    "path": path,
+                    "token_pair": " → ".join(path),
+                    "path_str": " → ".join(path),
+                    "buy_dex": "Kodiak V2",
+                    "sell_dex": "Kodiak V2",
+                    "buy_price": leg_details[0]["price"],
+                    "sell_price": leg_details[-1]["price"],
+                    "amount_in": str(amount_in),
+                    "amount_out": str(final_amount),
+                    "raw_profit_usd": raw_profit_usd,
+                    "spread_percent": profit_percent,
+                    "potential_profit_usd": raw_profit_usd,
+                    "gas_cost_usd": gas_cost_usd,
+                    "slippage_cost_usd": slippage_cost_usd,
+                    "net_profit_usd": net_profit_usd,
+                    "profit_percent": profit_percent,
+                    "total_gas": total_gas,
+                    "legs": leg_details,
+                    "hop_count": len(path) - 1,
+                    "risk_score": 0.6,  # Higher risk for multi-hop
+                    "liquidity_usd": 3000,
+                    "price_impact": 2.5,
+                    "token_in_address": base_info["address"],
+                    "token_out_address": base_info["address"]
+                })
+                arb_logger.log_opportunity(opportunities[-1])
+        except Exception as e:
+            logger.debug(f"Multi-hop arb error for path {path}: {e}")
             continue
     
     return sorted(opportunities, key=lambda x: x.get("net_profit_usd", 0), reverse=True)
@@ -871,7 +1283,7 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
             net_profit = raw_profit - gas_cost_usd - slippage_cost - impact_cost
             
             if net_profit > MIN_PROFIT_THRESHOLD:
-                opportunities.append({
+                opp_data = {
                     "id": str(uuid.uuid4()),
                     "type": "direct",
                     "token_pair": pair_key,
@@ -891,20 +1303,58 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
                     "price_impact": price_impact,
                     "slippage_cost_usd": slippage_cost,
                     "price_impact_cost_usd": impact_cost
-                })
+                }
+                opportunities.append(opp_data)
+                arb_logger.log_opportunity(opp_data)
+            else:
+                arb_logger.log_skip(pair_key, f"net_profit ${net_profit:.4f} < threshold")
     
-    # Find triangular arbitrage (disabled for performance - enable when needed)
-    # Triangular requires 3 sequential RPC calls per path which is slow
-    # In production, use dedicated background worker for triangular scanning
-    """
-    if len(price_matrix.prices) >= 3:
-        try:
-            tri_opps = await find_triangular_arbitrage("WBERA")
-            for tri_opp in tri_opps[:3]:
-                opportunities.append({...})
-        except Exception as e:
-            logger.debug(f"Triangular scan error: {e}")
-    """
+    # Lightweight triangular detection using cached prices
+    # Only check if we have enough price data in matrix
+    if len(price_matrix.prices) >= 4:
+        tri_paths = price_matrix.find_triangular_paths("WBERA")
+        for path in tri_paths[:5]:  # Check top 5 paths only
+            try:
+                # Quick profit estimate using cached prices
+                p1 = price_matrix.get_price(path[0], path[1])
+                p2 = price_matrix.get_price(path[1], path[2])
+                p3 = price_matrix.get_price(path[2], path[3])
+                
+                if p1 and p2 and p3:
+                    # Rough cycle profit: start with 1, multiply through
+                    cycle_return = p1 * p2 * p3
+                    cycle_profit_pct = (cycle_return - 1) * 100
+                    
+                    if cycle_profit_pct > MIN_SPREAD_THRESHOLD:
+                        # Estimate costs
+                        gas_cost_usd = (450000 * gas_price / 10**18) * bera_price
+                        net_estimate = (cycle_profit_pct / 100) * 100 * bera_price - gas_cost_usd
+                        
+                        if net_estimate > MIN_PROFIT_THRESHOLD:
+                            opportunities.append({
+                                "id": str(uuid.uuid4()),
+                                "type": "triangular",
+                                "token_pair": " → ".join(path),
+                                "buy_dex": "Kodiak V2",
+                                "sell_dex": "Kodiak V2",
+                                "buy_price": p1,
+                                "sell_price": p3,
+                                "spread_percent": cycle_profit_pct,
+                                "potential_profit_usd": net_estimate + gas_cost_usd,
+                                "gas_cost_usd": gas_cost_usd,
+                                "net_profit_usd": net_estimate,
+                                "amount_in": str(int(100 * 10**18)),
+                                "expected_out": str(int(100 * cycle_return * 10**18)),
+                                "token_in_address": TOKENS.get("WBERA", {}).get("address", ""),
+                                "token_out_address": TOKENS.get("WBERA", {}).get("address", ""),
+                                "liquidity_usd": 5000,
+                                "price_impact": 2.0,
+                                "slippage_cost_usd": 0.015 * net_estimate,
+                                "price_impact_cost_usd": 0.02 * net_estimate,
+                                "path": path
+                            })
+            except Exception:
+                continue
     
     # Rank by risk-adjusted profit
     ranked = rank_opportunities(opportunities)
@@ -930,8 +1380,13 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         ))
     
     scan_time = time.time() - start_time
+    direct_count = len([o for o in ranked if o.get("type") == "direct"])
     tri_count = len([o for o in ranked if o.get("type") == "triangular"])
-    logger.info(f"Scan: {scan_time:.2f}s, {len(result)} opps ({tri_count} tri)")
+    multi_count = len([o for o in ranked if o.get("type") == "multi_hop"])
+    
+    # Log scan metrics
+    arb_logger.log_scan(scan_time, len(result))
+    logger.info(f"Scan: {scan_time:.2f}s, {len(result)} opps (direct:{direct_count}, tri:{tri_count}, multi:{multi_count})")
     
     return result
 
@@ -1249,6 +1704,7 @@ async def execute_trade(request: ExecuteTradeRequest):
         
         if not verification["valid"]:
             logger.warning(f"[{execution_id}] Verification failed: {verification.get('error')}")
+            arb_logger.log_skip(request.pair, verification.get("error", "Verification failed"))
             return {
                 "success": False,
                 "error": verification.get("error", "Opportunity no longer profitable"),
@@ -1256,7 +1712,31 @@ async def execute_trade(request: ExecuteTradeRequest):
                 "execution_id": execution_id
             }
         
-        # 5. SAFETY CHECK: Profit must exceed gas cost
+        # 4.5 ON-CHAIN SIMULATION - Verify profit exists
+        logger.info(f"[{execution_id}] Running on-chain simulation...")
+        simulation = await verify_profit_onchain({
+            "token_pair": request.pair,
+            "amount_in": str(amount)
+        })
+        
+        # Log simulation result
+        arb_logger.log_simulation(simulation["valid"], simulation.get("reason", ""))
+        
+        if not simulation["valid"]:
+            logger.warning(f"[{execution_id}] Simulation failed: {simulation.get('reason')}")
+            arb_logger.log_skip(request.pair, f"Simulation: {simulation.get('reason')}")
+            return {
+                "success": False,
+                "error": f"On-chain simulation failed: {simulation.get('reason')}",
+                "simulation": simulation,
+                "execution_id": execution_id
+            }
+        
+        # Use simulated profit if available
+        if simulation.get("simulated_profit_usd"):
+            verification["net_profit_usd"] = simulation["simulated_profit_usd"]
+        
+        # 5. SAFETY CHECK: Profit must exceed gas cost (strict: revert if <= 0)
         if verification["net_profit_usd"] <= verification["gas_cost_usd"]:
             logger.warning(f"[{execution_id}] Profit ${verification['net_profit_usd']:.4f} <= gas ${verification['gas_cost_usd']:.4f}")
             return {
@@ -1642,13 +2122,14 @@ async def get_pool_reserves_endpoint(token_a: str, token_b: str):
 
 @api_router.get("/engine/stats")
 async def get_engine_stats():
-    """Get trading engine statistics"""
+    """Get comprehensive trading engine statistics"""
     return {
         "cache": {
             "pools_cached": len(cache.pool_reserves),
             "pairs_cached": len(cache.pair_addresses),
             "honeypot_blacklist_size": len(cache.honeypot_blacklist),
-            "gas_price": cache.gas_price / 10**9
+            "gas_price_gwei": cache.gas_price / 10**9,
+            "bera_price_usd": cache.token_prices.get("bera", 0)
         },
         "price_matrix": {
             "tokens_tracked": len(price_matrix.prices),
@@ -1665,9 +2146,26 @@ async def get_engine_stats():
             "max_slippage_percent": MAX_SLIPPAGE_PERCENT,
             "max_price_impact_percent": MAX_PRICE_IMPACT_PERCENT,
             "min_profit_threshold": MIN_PROFIT_THRESHOLD,
-            "min_liquidity_usd": MIN_LIQUIDITY_USD
-        }
+            "min_liquidity_usd": MIN_LIQUIDITY_USD,
+            "min_spread_threshold": MIN_SPREAD_THRESHOLD,
+            "max_hop_count": MAX_HOP_COUNT
+        },
+        "arb_logger": arb_logger.get_stats()
     }
+
+@api_router.get("/multi-hop-opportunities")
+async def get_multi_hop_opportunities(base_token: str = "WBERA", max_hops: int = 4):
+    """Get multi-hop arbitrage opportunities (4+ tokens)"""
+    try:
+        opps = await find_multi_hop_arbitrage(base_token, max_hops=min(max_hops, MAX_HOP_COUNT))
+        return {
+            "base_token": base_token,
+            "max_hops": max_hops,
+            "opportunities": opps,
+            "count": len(opps)
+        }
+    except Exception as e:
+        return {"error": str(e), "opportunities": [], "count": 0}
 
 @api_router.get("/triangular-opportunities")
 async def get_triangular_opportunities(base_token: str = "WBERA"):
