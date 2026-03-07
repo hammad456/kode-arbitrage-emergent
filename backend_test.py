@@ -376,6 +376,95 @@ class BerachainArbBotAPITester:
         
         return success
 
+    def test_engine_stats_endpoint(self):
+        """Test engine stats endpoint"""
+        success, response = self.run_test(
+            "Trading Engine Statistics",
+            "GET",
+            "api/engine/stats",
+            200
+        )
+        
+        if success:
+            cache_info = response.get('cache', {})
+            auto_engine_info = response.get('auto_engine', {})
+            safety_limits = response.get('safety_limits', {})
+            
+            print(f"   Pools Cached: {cache_info.get('pools_cached', 0)}")
+            print(f"   Pairs Cached: {cache_info.get('pairs_cached', 0)}")
+            print(f"   Gas Price: {cache_info.get('gas_price', 0)} gwei")
+            print(f"   Auto Engine Enabled: {auto_engine_info.get('enabled', False)}")
+            print(f"   Max Trade Size: ${safety_limits.get('max_trade_size_usd', 0)}")
+            print(f"   Min Profit Threshold: ${safety_limits.get('min_profit_threshold', 0)}")
+        
+        return success
+
+    def test_honeypot_check_endpoint(self):
+        """Test honeypot detection endpoint"""
+        # Test with HONEY token (should be safe)
+        honey_token = "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce"
+        
+        success, response = self.run_test(
+            "Honeypot Detection - HONEY Token",
+            "GET",
+            f"api/honeypot/check/{honey_token}",
+            200
+        )
+        
+        if success:
+            is_honeypot = response.get('is_honeypot', True)
+            reason = response.get('reason', 'N/A')
+            tax_percent = response.get('tax_percent', 0)
+            
+            print(f"   Is Honeypot: {is_honeypot}")
+            print(f"   Reason: {reason}")
+            if not is_honeypot and tax_percent is not None:
+                print(f"   Tax Percent: {tax_percent:.2f}%")
+        
+        return success
+
+    def test_auto_execute_status_endpoint(self):
+        """Test auto-execution status endpoint"""
+        success, response = self.run_test(
+            "Auto-Execution Engine Status",
+            "GET",
+            "api/auto-execute/status",
+            200
+        )
+        
+        if success:
+            print(f"   Enabled: {response.get('enabled', False)}")
+            print(f"   Wallet Address: {response.get('wallet_address', 'None')}")
+            print(f"   Min Profit: ${response.get('min_profit', 0)}")
+            print(f"   Max Slippage: {response.get('max_slippage', 0)}%")
+            print(f"   Execution Count: {response.get('execution_count', 0)}")
+            print(f"   Total Profit: ${response.get('total_profit', 0)}")
+        
+        return success
+
+    def test_pool_reserves_endpoint(self):
+        """Test pool reserves endpoint"""
+        # Test WBERA/HONEY pool
+        wbera = "0x6969696969696969696969696969696969696969"
+        honey = "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce"
+        
+        success, response = self.run_test(
+            "Pool Reserves - WBERA/HONEY",
+            "GET",
+            f"api/pool/reserves?token_a={wbera}&token_b={honey}",
+            200
+        )
+        
+        if success:
+            print(f"   Pair Address: {response.get('pair_address', 'N/A')[:20]}...")
+            print(f"   Reserve A: {response.get('reserve_a', 'N/A')}")
+            print(f"   Reserve B: {response.get('reserve_b', 'N/A')}")
+            if 'reserve_a_formatted' in response:
+                print(f"   Reserve A (formatted): {response['reserve_a_formatted']:.2f}")
+                print(f"   Reserve B (formatted): {response['reserve_b_formatted']:.2f}")
+        
+        return success
+
 def main():
     print("🚀 Starting BeraArb API Testing...")
     print("=" * 60)
@@ -393,6 +482,10 @@ def main():
         tester.test_analytics_endpoint,
         tester.test_settings_endpoints,
         tester.test_quote_endpoint,
+        tester.test_engine_stats_endpoint,
+        tester.test_honeypot_check_endpoint,
+        tester.test_auto_execute_status_endpoint,
+        tester.test_pool_reserves_endpoint,
         tester.test_execute_trade_validation,
         tester.test_execute_trade_safety_checks,
     ]
