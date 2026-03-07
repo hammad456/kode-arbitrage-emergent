@@ -1441,15 +1441,36 @@ async def check_honeypot(token_address: str):
 @api_router.get("/pool/reserves")
 async def get_pool_reserves_endpoint(token_a: str, token_b: str):
     """Get pool reserves and liquidity info"""
-    reserves = await get_pool_reserves(token_a, token_b)
+    # Try to get token addresses from symbols if provided
+    token_a_addr = token_a
+    token_b_addr = token_b
+    
+    # Check if input is a symbol instead of address
+    if len(token_a) < 20:
+        token_info = TOKENS.get(token_a.upper())
+        if token_info:
+            token_a_addr = token_info["address"]
+    
+    if len(token_b) < 20:
+        token_info = TOKENS.get(token_b.upper())
+        if token_info:
+            token_b_addr = token_info["address"]
+    
+    reserves = await get_pool_reserves(token_a_addr, token_b_addr)
     if not reserves:
-        raise HTTPException(status_code=404, detail="Pool not found")
+        return {
+            "found": False,
+            "message": "Pool not found or reserves unavailable",
+            "token_a": token_a_addr,
+            "token_b": token_b_addr
+        }
     
     # Get token info
-    token_a_info = next((t for t in TOKENS.values() if t["address"].lower() == token_a.lower()), None)
-    token_b_info = next((t for t in TOKENS.values() if t["address"].lower() == token_b.lower()), None)
+    token_a_info = next((t for t in TOKENS.values() if t["address"].lower() == token_a_addr.lower()), None)
+    token_b_info = next((t for t in TOKENS.values() if t["address"].lower() == token_b_addr.lower()), None)
     
     response = {
+        "found": True,
         "pair_address": reserves["pair_address"],
         "reserve_a": str(reserves["reserve_a"]),
         "reserve_b": str(reserves["reserve_b"]),

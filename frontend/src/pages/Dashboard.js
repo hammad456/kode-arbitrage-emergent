@@ -66,6 +66,7 @@ export default function Dashboard() {
     const wsRef = useRef(null);
     const reconnectTimeoutRef = useRef(null);
     const pollingIntervalRef = useRef(null);
+    const wsFailedRef = useRef(false);
 
     // Fetch data via REST API (fallback when WebSocket unavailable)
     const fetchDataREST = useCallback(async () => {
@@ -75,7 +76,7 @@ export default function Dashboard() {
                 axios.get(`${API_URL}/api/gas-price`)
             ]);
             
-            setOpportunities(oppRes.data);
+            setOpportunities(oppRes.data || []);
             setGasPrice(gasRes.data);
             setLastUpdate(new Date());
             setLoading(false);
@@ -87,12 +88,33 @@ export default function Dashboard() {
 
     // WebSocket connection with REST API fallback
     const connectWebSocket = useCallback(() => {
+        // Skip WebSocket if it has failed before (use polling instead)
+        if (wsFailedRef.current) {
+            if (!pollingIntervalRef.current) {
+                fetchDataREST();
+                pollingIntervalRef.current = setInterval(fetchDataREST, 5000);
+            }
+            return;
+        }
+        
         if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
         try {
             const ws = new WebSocket(`${WS_URL}/ws/prices`);
             
+            // Set timeout for connection
+            const connectionTimeout = setTimeout(() => {
+                if (ws.readyState !== WebSocket.OPEN) {
+                    console.log('WebSocket connection timeout, switching to polling');
+                    wsFailedRef.current = true;
+                    ws.close();
+                    fetchDataREST();
+                    pollingIntervalRef.current = setInterval(fetchDataREST, 5000);
+                }
+            }, 5000);
+            
             ws.onopen = () => {
+                clearTimeout(connectionTimeout);
                 console.log('WebSocket connected');
                 setWsConnected(true);
                 setLoading(false);
@@ -152,8 +174,12 @@ export default function Dashboard() {
         }
     }, [fetchDataREST]);
 
-    // Initialize WebSocket on mount
+    // Initialize WebSocket on mount with immediate data fetch
     useEffect(() => {
+        // Always fetch initial data immediately
+        fetchDataREST();
+        
+        // Then try WebSocket
         connectWebSocket();
         
         return () => {
@@ -167,7 +193,7 @@ export default function Dashboard() {
                 clearInterval(pollingIntervalRef.current);
             }
         };
-    }, [connectWebSocket]);
+    }, [connectWebSocket, fetchDataREST]);
 
     // Fetch balances from API
     const fetchBalances = useCallback(async () => {

@@ -1,83 +1,76 @@
-# BeraArb - Berachain Arbitrage Trading Bot
+# BeraArb - Berachain Arbitrage Trading Engine
 
-## Original Problem Statement
-Build a sophisticated arbitrage trading application for Berachain that is safe and intelligently profitable. The app should have a complete frontend and backend that works in real-time. The application must calculate slippage, price impact, and gas fees.
+## Latest Enhancement (Jan 2026)
 
-## Architecture Update (Jan 2026)
+### Trading Engine Upgrades
+1. **Real-time Opportunity Detection**
+   - Batch RPC queries via parallel async tasks
+   - Extended pairs: 9 trading pairs monitored
+   - Scan cycle < 2 seconds with caching
 
-### Backend Enhancements
-- Enhanced POST /api/execute-trade endpoint with real blockchain execution
-- Comprehensive safety checks implemented
-- WebSocket real-time price streaming
-- REST API fallback for polling
+2. **Automatic Arbitrage Execution**
+   - AutoExecutionEngine class with cooldown
+   - Profit calculation: net = raw - gas - slippage - price_impact
+   - Execute only when net_profit > threshold
 
-### Trade Execution Flow
-1. Validate inputs (pair, wallet, amount)
-2. Re-fetch latest pool prices from both DEXes
-3. Estimate gas cost with 30% buffer
-4. Calculate: net_profit = raw_profit - gas_cost - slippage_cost
-5. Execute only if net_profit > minimum_threshold
-6. Build transactions for both legs (buy + sell)
-7. Return transaction data for wallet signing
+3. **Opportunity Ranking**
+   - Score = 60% profit + 25% gas efficiency + 15% liquidity
+   - Best opportunities shown first
 
-### Safety Checks
-- MAX_TRADE_SIZE_USD: $10,000
-- MAX_GAS_LIMIT: 500,000
-- MAX_SLIPPAGE_PERCENT: 5%
-- PRICE_CHANGE_TOLERANCE: 2%
-- GAS_BUFFER_MULTIPLIER: 1.3x
-- Abort if profit < gas cost
-- Abort if spread becomes negative
-- Abort if slippage exceeds tolerance
+4. **Liquidity & Price Impact Protection**
+   - Pool reserves fetching via factory contract
+   - MIN_LIQUIDITY_USD = $1,000 required
+   - MAX_PRICE_IMPACT_PERCENT = 3%
 
-## What's Been Implemented
+5. **Honeypot Detection**
+   - Simulates buy/sell via eth_call
+   - Blacklists tokens with >30% tax
+   - Endpoint: GET /api/honeypot/check/{token}
 
-### Backend (server.py)
-- [x] POST /api/execute-trade with full verification
-- [x] On-chain price revalidation before execution
-- [x] Gas estimation with buffer
-- [x] Slippage cost calculation
-- [x] Safety checks (trade size, gas, profit threshold)
-- [x] Build both buy and sell transactions
-- [x] POST /api/execute-trade/confirm for recording results
-- [x] WebSocket /ws/prices for real-time updates (3 second interval)
+6. **Safety Limits**
+   - MAX_TRADE_SIZE_USD: $10,000
+   - MAX_SLIPPAGE_PERCENT: 5%
+   - GAS_BUFFER_MULTIPLIER: 1.3x
+   - TRADE_TIMEOUT_SECONDS: 120
 
-### Frontend (Dashboard.js)
-- [x] WebSocket connection for real-time data
-- [x] REST API polling fallback when WebSocket unavailable
-- [x] Connection status indicator (Live/Polling/Connecting)
-- [x] Trade execution modal with verification display
-- [x] Wallet connection with MetaMask
-- [x] executeTrade() function for signing transactions
+### New Backend Features
+- TradingCache: Pool data, token prices, gas caching
+- AutoExecutionEngine: Automated trading with cooldown
+- rank_opportunities(): Score-based sorting
+- detect_honeypot(): Token safety verification
+- get_pool_reserves(): Liquidity checks
+- calculate_price_impact(): AMM formula calculation
 
-### API Endpoints
-- GET /api/health - Health check
-- GET /api/opportunities - Arbitrage opportunities
-- GET /api/gas-price - Current gas pricing
-- POST /api/execute-trade - Execute arbitrage with safety checks
-- POST /api/execute-trade/confirm - Confirm and record execution
+### New API Endpoints
+- GET /api/engine/stats - Cache and engine statistics
+- GET /api/honeypot/check/{token} - Honeypot detection
+- GET /api/pool/reserves - Pool liquidity info
+- POST /api/auto-execute/enable - Enable auto-trading
+- POST /api/auto-execute/disable - Disable auto-trading
+- GET /api/auto-execute/status - Engine status
+
+### Frontend Updates
+- Immediate REST API data fetch on load
+- WebSocket with 5-second timeout fallback
+- Polling every 5 seconds when WS unavailable
+- Connection status: Live/Polling/Connecting
 
 ## MOCKED Components
-- BEX Router uses same address as Kodiak V2 (actual BEX contracts not public)
+- BEX DEX: Uses Kodiak router with price variation simulation
 
 ## Prioritized Backlog
 
 ### P0 (Critical)
-- [ ] Integrate actual BEX router when addresses available
-- [ ] Add token approval flow before swaps
-- [ ] Implement flash loan integration
+- [ ] Integrate actual BEX router contracts
+- [ ] Add token approval flow
+- [ ] Implement flash loans
 
-### P1 (High Priority)
-- [ ] Multi-hop arbitrage paths
+### P1 (High Priority)  
+- [ ] Multi-hop arbitrage (A→B→C→A)
 - [ ] MEV protection (Flashbots)
-- [ ] Price alerts via notifications
+- [ ] Telegram notifications
 
 ### P2 (Medium Priority)
-- [ ] Historical profit tracking
+- [ ] Historical profit charts
 - [ ] Multiple wallet support
-- [ ] Telegram bot integration
-
-## Next Tasks
-1. Get actual BEX contract addresses from Berachain team
-2. Add ERC20 approve() calls before swaps
-3. Implement flash loan for capital efficiency
+- [ ] Custom token pairs
