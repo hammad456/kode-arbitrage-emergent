@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
+import sys
 import logging
 from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
@@ -20,6 +21,19 @@ import time
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# Add backend to path for module imports
+sys.path.insert(0, str(ROOT_DIR))
+
+# Import production modules
+from core.constants import (
+    PRIVATE_RPC_URL, DEX_FEE_PERCENT, MAX_RETRY_ATTEMPTS,
+    RETRY_BASE_DELAY, GAS_INCREASE_PER_RETRY, MAX_UINT256
+)
+from execution.token_approval import TokenApprovalManager
+from execution.atomic_executor import AtomicArbExecutor, TradeLogger
+from execution.flash_loan import FlashLoanExecutor
+from scanner.multicall_scanner import RealPriceScanner
+
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
@@ -31,6 +45,21 @@ CHAIN_ID = 80094
 
 # Initialize Web3
 w3 = Web3(Web3.HTTPProvider(BERACHAIN_RPC))
+
+# Initialize Private RPC for MEV Protection (if configured)
+private_rpc_url = os.environ.get('PRIVATE_RPC_URL', '')
+private_w3 = Web3(Web3.HTTPProvider(private_rpc_url)) if private_rpc_url else None
+
+# Initialize Production Execution Components
+token_approval_manager = TokenApprovalManager(w3)
+atomic_executor = AtomicArbExecutor(w3, private_w3)
+flash_loan_executor = FlashLoanExecutor(w3)
+real_price_scanner = RealPriceScanner(w3)
+trade_logger = TradeLogger()
+
+# Production Mode Flag
+PRODUCTION_MODE = os.environ.get('PRODUCTION_MODE', 'false').lower() == 'true'
+USE_PRIVATE_RPC = os.environ.get('USE_PRIVATE_RPC', 'true').lower() == 'true'
 
 # Safety limits - Production ready (Micro-Arbitrage Optimized)
 MAX_TRADE_SIZE_USD = 10000
@@ -53,12 +82,16 @@ MULTI_HOP_GAS_PER_SWAP = 150000
 # Logging config
 ARB_LOG_ENABLED = True
 
-# DEX Contract Addresses (Berachain Mainnet)
+# DEX Contract Addresses (Berachain Mainnet - Production)
 KODIAK_V3_ROUTER = "0xEd158C4b336A6FCb5B193A5570e3a571f6cbe690"
 KODIAK_V2_ROUTER = "0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022"
 KODIAK_V2_FACTORY = "0x5C346464d33F90bABaf70dB6388507CC889C1070"
 KODIAK_QUOTER = "0x644C8D6E501f7C994B74F5ceA96abe65d0BA662B"
-BEX_ROUTER = "0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022"  # Using same for simulation
+# BEX (Berachain Exchange) - Official CrocSwap Router
+BEX_ROUTER = "0x21e2C0AFd058A89FCf7caf3aEA3cB84Ae977B73D"
+BEX_QUERY = "0x8685CE9Db06D40CBa73e3d09e6868FE476B5dC89"
+# Honeypot Router
+HONEYPOT_ROUTER = "0x1306D3c36eC7E38dd2c128fBe3097C2C2449af64"
 WBERA = "0x6969696969696969696969696969696969696969"
 
 # Common tokens on Berachain
@@ -449,7 +482,7 @@ async def multicall_batch_quotes(calls_data: List[Dict]) -> List[Optional[int]]:
         calls = []
         for call in calls_data:
             router = w3.eth.contract(address=Web3.to_checksum_address(call["router"]), abi=ROUTER_V2_ABI)
-            calldata = router.encodeABI(fn_name="getAmountsOut", args=[call["amount_in"], call["path"]])
+            calldata = router.encode_abi('getAmountsOut', args=[call["amount_in"], call["path"]])
             calls.append((call["router"], True, calldata))  # allowFailure=True
         
         # Execute multicall
@@ -1242,28 +1275,48 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         if price_impact > MAX_PRICE_IMPACT_PERCENT:
             continue
         
-        # Simulate BEX quote with variation
-        import random
-        variation = random.uniform(-0.025, 0.025)
-        bex_amount_out = int(int(quote.amount_out) * (1 + variation))
-        bex_price = quote.price * (1 + variation)
+        # Get REAL quote from second DEX
+        # Note: BEX uses CrocSwap interface - for now use Kodiak V3 for comparison
+        # TODO: Implement CrocSwap query interface for BEX when deployed
+        second_dex_quote = None
+        second_dex_name = "Kodiak V3"
         
-        bex_quote = PriceQuote(
-            dex="BEX",
-            token_in=quote.token_in,
-            token_out=quote.token_out,
-            amount_in=quote.amount_in,
-            amount_out=str(bex_amount_out),
-            price=bex_price,
-            price_impact=price_impact * 0.9,
-            gas_estimate=120000
-        )
+        try:
+            # Try Kodiak V3 first (different router, may have different prices)
+            second_dex_quote = await get_dex_quote_fast(
+                KODIAK_V3_ROUTER,
+                token_a_info["address"],
+                token_b_info["address"],
+                amount_in,
+                "Kodiak V3"
+            )
+        except Exception as v3_err:
+            logger.debug(f"Kodiak V3 quote error: {v3_err}")
         
-        # Determine arbitrage direction
-        if quote.price > bex_quote.price:
-            buy_quote, sell_quote = bex_quote, quote
+        # If V3 failed, try BEX (CrocSwap interface)
+        if not second_dex_quote:
+            try:
+                second_dex_quote = await get_dex_quote_fast(
+                    BEX_ROUTER,
+                    token_a_info["address"],
+                    token_b_info["address"],
+                    amount_in,
+                    "BEX"
+                )
+                second_dex_name = "BEX"
+            except Exception as bex_err:
+                logger.debug(f"BEX quote error: {bex_err}")
+        
+        # If no second DEX quote available, skip this pair
+        if not second_dex_quote:
+            arb_logger.log_skip(pair_key, "No second DEX quote available")
+            continue
+        
+        # Determine arbitrage direction based on REAL prices
+        if quote.price > second_dex_quote.price:
+            buy_quote, sell_quote = second_dex_quote, quote
         else:
-            buy_quote, sell_quote = quote, bex_quote
+            buy_quote, sell_quote = quote, second_dex_quote
         
         spread = ((sell_quote.price - buy_quote.price) / buy_quote.price) * 100
         
@@ -2141,6 +2194,14 @@ async def get_engine_stats():
             "execution_count": auto_engine.execution_count,
             "total_profit": auto_engine.total_profit
         },
+        "production": {
+            "mode": PRODUCTION_MODE,
+            "private_rpc_configured": bool(private_rpc_url),
+            "use_private_rpc": USE_PRIVATE_RPC,
+            "atomic_executor_stats": atomic_executor.get_execution_stats(),
+            "scanner_metrics": real_price_scanner.get_scan_metrics(),
+            "approvals_cached": len(token_approval_manager.approval_cache)
+        },
         "safety_limits": {
             "max_trade_size_usd": MAX_TRADE_SIZE_USD,
             "max_slippage_percent": MAX_SLIPPAGE_PERCENT,
@@ -2148,7 +2209,10 @@ async def get_engine_stats():
             "min_profit_threshold": MIN_PROFIT_THRESHOLD,
             "min_liquidity_usd": MIN_LIQUIDITY_USD,
             "min_spread_threshold": MIN_SPREAD_THRESHOLD,
-            "max_hop_count": MAX_HOP_COUNT
+            "max_hop_count": MAX_HOP_COUNT,
+            "dex_fee_percent": DEX_FEE_PERCENT,
+            "max_retry_attempts": MAX_RETRY_ATTEMPTS,
+            "gas_increase_per_retry": f"{GAS_INCREASE_PER_RETRY * 100}%"
         },
         "arb_logger": arb_logger.get_stats()
     }
@@ -2179,6 +2243,301 @@ async def get_triangular_opportunities(base_token: str = "WBERA"):
         }
     except Exception as e:
         return {"error": str(e), "opportunities": [], "count": 0}
+
+# ============== PRODUCTION EXECUTION ENDPOINTS ==============
+
+class AtomicExecutionRequest(BaseModel):
+    """Request for atomic arbitrage execution"""
+    opportunity_id: str
+    wallet_address: str
+    private_key: str  # WARNING: Only for backend execution, never log
+    slippage_tolerance: float = 0.5
+    use_private_rpc: bool = True
+    use_flash_loan: bool = False
+
+class TokenApprovalRequest(BaseModel):
+    """Request for token approval"""
+    token_address: str
+    spender_address: str
+    wallet_address: str
+    private_key: str  # WARNING: Only for backend execution
+    amount: Optional[str] = None  # If None, approves MAX_UINT256
+
+@api_router.post("/production/execute-atomic")
+async def execute_atomic_arbitrage(request: AtomicExecutionRequest):
+    """
+    Production atomic arbitrage execution with:
+    - Pre-trade simulation via eth_call
+    - Token approval flow
+    - Retry logic with gas escalation
+    - Private RPC for MEV protection
+    - Comprehensive logging
+    """
+    try:
+        # Get the opportunity from recent scan
+        opportunities = await find_arbitrage_opportunities_fast()
+        opportunity = None
+        for opp in opportunities:
+            if opp.id == request.opportunity_id:
+                opportunity = opp.model_dump()
+                break
+        
+        if not opportunity:
+            return {
+                "success": False,
+                "error": "Opportunity not found or expired. Scan again.",
+                "opportunities_available": len(opportunities)
+            }
+        
+        # Get current BERA price
+        bera_price = await get_token_price_coingecko("berachain-bera")
+        
+        # Check and approve tokens if needed
+        tokens = opportunity["token_pair"].split("/")
+        token_in = TOKENS.get(tokens[0])
+        
+        if token_in:
+            # Determine which router needs approval
+            buy_dex = opportunity.get("buy_dex", "Kodiak V2")
+            buy_router = KODIAK_V2_ROUTER if "Kodiak" in buy_dex else BEX_ROUTER
+            
+            approval_result = await token_approval_manager.ensure_approval(
+                token_address=token_in["address"],
+                spender=buy_router,
+                owner=request.wallet_address,
+                required_amount=int(opportunity["amount_in"]),
+                private_key=request.private_key
+            )
+            
+            if not approval_result["success"]:
+                return {
+                    "success": False,
+                    "error": f"Token approval failed: {approval_result.get('error')}",
+                    "approval_result": approval_result
+                }
+        
+        # Execute atomic arbitrage
+        result = await atomic_executor.execute_arbitrage(
+            opportunity=opportunity,
+            wallet_address=request.wallet_address,
+            private_key=request.private_key,
+            slippage_tolerance=request.slippage_tolerance,
+            use_private_rpc=request.use_private_rpc,
+            bera_price_usd=bera_price
+        )
+        
+        # Store in database
+        if result["success"]:
+            trade_doc = {
+                "id": result["trade_id"],
+                "wallet_address": request.wallet_address.lower(),
+                "token_pair": opportunity["token_pair"],
+                "buy_dex": opportunity["buy_dex"],
+                "sell_dex": opportunity["sell_dex"],
+                "amount_in": opportunity["amount_in"],
+                "expected_profit_usd": opportunity["net_profit_usd"],
+                "actual_profit_usd": result["actual_profit_usd"],
+                "gas_used": result["total_gas_used"],
+                "buy_tx_hash": result["buy_result"]["tx_hash"] if result["buy_result"] else None,
+                "sell_tx_hash": result["sell_result"]["tx_hash"] if result["sell_result"] else None,
+                "status": "success",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            await db.trades.insert_one(trade_doc)
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Atomic execution error: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@api_router.post("/production/approve-token")
+async def approve_token(request: TokenApprovalRequest):
+    """
+    Approve token for DEX trading with retry logic.
+    Approves MAX_UINT256 by default to avoid repeated approvals.
+    """
+    try:
+        amount = int(request.amount) if request.amount else MAX_UINT256
+        
+        result = await token_approval_manager.approve_token(
+            token_address=request.token_address,
+            spender=request.spender_address,
+            owner=request.wallet_address,
+            private_key=request.private_key,
+            amount=amount
+        )
+        
+        return result
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@api_router.get("/production/check-allowance")
+async def check_token_allowance(
+    token_address: str,
+    spender_address: str,
+    owner_address: str
+):
+    """Check current token allowance"""
+    try:
+        allowance = await token_approval_manager.check_allowance(
+            token_address=token_address,
+            spender=spender_address,
+            owner=owner_address
+        )
+        
+        # Get token decimals for formatted display
+        token_info = next(
+            (t for t in TOKENS.values() if t["address"].lower() == token_address.lower()),
+            None
+        )
+        
+        decimals = token_info["decimals"] if token_info else 18
+        
+        return {
+            "allowance_raw": str(allowance),
+            "allowance_formatted": allowance / (10 ** decimals),
+            "is_unlimited": allowance >= MAX_UINT256 // 2,
+            "token_address": token_address,
+            "spender": spender_address,
+            "owner": owner_address
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+@api_router.post("/production/flash-arbitrage")
+async def execute_flash_arbitrage(request: AtomicExecutionRequest):
+    """
+    Execute flash loan arbitrage for capital efficiency.
+    Borrows liquidity, executes arbitrage, repays within single transaction.
+    
+    Note: Requires deployed FlashArbitrage contract on Berachain.
+    """
+    try:
+        # Get the opportunity
+        opportunities = await find_arbitrage_opportunities_fast()
+        opportunity = None
+        for opp in opportunities:
+            if opp.id == request.opportunity_id:
+                opportunity = opp.model_dump()
+                break
+        
+        if not opportunity:
+            return {
+                "success": False,
+                "error": "Opportunity not found or expired"
+            }
+        
+        # Prepare flash arbitrage data
+        flash_data = await flash_loan_executor.prepare_flash_arbitrage_data(
+            opportunity=opportunity,
+            wallet_address=request.wallet_address
+        )
+        
+        if not flash_data:
+            return {
+                "success": False,
+                "error": "Failed to prepare flash arbitrage data"
+            }
+        
+        # Get current prices
+        bera_price = await get_token_price_coingecko("berachain-bera")
+        gas_price = w3.eth.gas_price
+        
+        # Simulate to verify profitability
+        simulation = await flash_loan_executor.simulate_flash_arbitrage(
+            flash_data=flash_data,
+            gas_price_wei=gas_price,
+            bera_price_usd=bera_price
+        )
+        
+        if not simulation["profitable"]:
+            return {
+                "success": False,
+                "error": f"Flash arbitrage not profitable: {simulation['reason']}",
+                "simulation": simulation
+            }
+        
+        # Return flash arbitrage transaction data
+        # Note: Actual execution requires deployed FlashArbitrage contract
+        return {
+            "success": True,
+            "flash_data": flash_data,
+            "simulation": simulation,
+            "message": "Flash arbitrage prepared. Deploy FlashArbitrage contract to execute.",
+            "contract_bytecode_hint": "See flash_loan_executor.get_flash_arbitrage_contract_bytecode()"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@api_router.get("/production/scan-real")
+async def scan_real_opportunities():
+    """
+    Production scan using real on-chain data via Multicall.
+    No mock data - all prices fetched from actual DEX contracts.
+    """
+    try:
+        # Update gas price
+        gas_price = w3.eth.gas_price
+        bera_price = await get_token_price_coingecko("berachain-bera")
+        
+        # Use real price scanner
+        opportunities = await real_price_scanner.scan_arbitrage_opportunities(
+            gas_price_wei=gas_price,
+            bera_price_usd=bera_price
+        )
+        
+        # Get scanner metrics
+        metrics = real_price_scanner.get_scan_metrics()
+        
+        return {
+            "opportunities": opportunities,
+            "count": len(opportunities),
+            "scan_metrics": metrics,
+            "gas_price_gwei": gas_price / 10**9,
+            "bera_price_usd": bera_price
+        }
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "opportunities": [],
+            "count": 0
+        }
+
+@api_router.get("/production/execution-stats")
+async def get_production_execution_stats():
+    """Get production execution statistics"""
+    return {
+        "atomic_executor": atomic_executor.get_execution_stats(),
+        "scanner": real_price_scanner.get_scan_metrics(),
+        "approvals_cached": len(token_approval_manager.approval_cache),
+        "production_mode": PRODUCTION_MODE,
+        "private_rpc_configured": bool(private_rpc_url),
+        "use_private_rpc": USE_PRIVATE_RPC
+    }
+
+@api_router.get("/production/trade-history")
+async def get_production_trade_history(limit: int = 100):
+    """Get recent trades from CSV log"""
+    trades = trade_logger.get_recent_trades(limit)
+    return {
+        "trades": trades,
+        "count": len(trades)
+    }
+
 
 # WebSocket endpoint for real-time updates
 @app.websocket("/ws/prices")

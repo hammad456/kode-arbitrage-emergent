@@ -1,0 +1,1 @@
+timestamp,trade_id,pair,type,buy_dex,sell_dex,amount_in,expected_out,actual_out,expected_profit_usd,actual_profit_usd,gas_used,gas_price_gwei,gas_cost_usd,buy_tx_hash,sell_tx_hash,status,error,retry_count,execution_time_ms,slippage_actual

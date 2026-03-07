@@ -1,526 +1,550 @@
-import requests
-import sys
-from datetime import datetime
+#!/usr/bin/env python3
+"""
+Backend API Testing for Berachain Production Arbitrage Engine
+Tests all production endpoints with real on-chain data integration
+"""
+
+import asyncio
+import aiohttp
 import json
+import sys
+import time
+import os
+from typing import Dict, List, Any
 
-class BerachainArbBotAPITester:
-    def __init__(self, base_url="https://arb-execution-hub.preview.emergentagent.com"):
-        self.base_url = base_url
-        self.tests_run = 0
-        self.tests_passed = 0
-        self.failed_tests = []
-        self.mock_wallet = "0x742d35Cc6634C0532925a3b8D4c78c9f35717361"
+# Get backend URL from frontend env
+def get_backend_url():
+    """Get backend URL from frontend .env file"""
+    try:
+        with open('/app/frontend/.env', 'r') as f:
+            for line in f:
+                if line.startswith('REACT_APP_BACKEND_URL'):
+                    url = line.split('=')[1].strip()
+                    return f"{url}/api"
+        return "http://localhost:8001/api"
+    except Exception:
+        return "http://localhost:8001/api"
 
-    def run_test(self, name, method, endpoint, expected_status, data=None, headers=None):
-        """Run a single API test"""
-        url = f"{self.base_url}/{endpoint}"
-        if headers is None:
-            headers = {'Content-Type': 'application/json'}
+BASE_URL = get_backend_url()
 
-        self.tests_run += 1
-        print(f"\n🔍 Testing {name}...")
-        print(f"   URL: {url}")
+class BerachainArbEngineTest:
+    def __init__(self):
+        self.base_url = BASE_URL
+        self.session = None
+        self.results = []
         
+    async def __aenter__(self):
+        """Async context manager entry"""
+        timeout = aiohttp.ClientTimeout(total=30)
+        self.session = aiohttp.ClientSession(timeout=timeout)
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        if self.session:
+            await self.session.close()
+    
+    async def make_request(self, method: str, endpoint: str, **kwargs) -> Dict:
+        """Make HTTP request with error handling"""
+        url = f"{self.base_url}{endpoint}"
         try:
-            if method == 'GET':
-                response = requests.get(url, headers=headers, timeout=30)
-            elif method == 'POST':
-                response = requests.post(url, json=data, headers=headers, timeout=30)
-
-            print(f"   Status: {response.status_code}")
-            
-            success = response.status_code == expected_status
-            if success:
-                self.tests_passed += 1
-                print(f"✅ PASSED - Status: {response.status_code}")
-                return True, response.json() if response.content else {}
-            else:
-                print(f"❌ FAILED - Expected {expected_status}, got {response.status_code}")
-                if response.content:
-                    try:
-                        error_data = response.json()
-                        print(f"   Error details: {error_data}")
-                    except:
-                        print(f"   Response text: {response.text[:200]}")
-                        
-                self.failed_tests.append({
-                    "name": name,
-                    "endpoint": endpoint,
-                    "expected": expected_status,
-                    "actual": response.status_code,
-                    "error": response.text[:200] if response.content else "No response"
-                })
-                return False, {}
-
-        except requests.exceptions.RequestException as e:
-            print(f"❌ FAILED - Network Error: {str(e)}")
-            self.failed_tests.append({
-                "name": name,
-                "endpoint": endpoint,
-                "expected": expected_status,
-                "actual": "Network Error",
-                "error": str(e)
-            })
-            return False, {}
-
-    def test_health_endpoint(self):
-        """Test health check and RPC connection"""
-        success, response = self.run_test(
-            "Health Check",
-            "GET",
-            "api/health",
-            200
-        )
-        
-        if success:
-            rpc_connected = response.get('rpc_connected', False)
-            if rpc_connected:
-                print(f"   RPC Status: Connected ✅")
-                print(f"   Block Number: {response.get('block_number', 'N/A')}")
-                print(f"   Chain ID: {response.get('chain_id', 'N/A')}")
-            else:
-                print(f"   ⚠️ WARNING: RPC not connected")
-        
-        return success
-
-    def test_opportunities_endpoint(self):
-        """Test arbitrage opportunities endpoint"""
-        success, response = self.run_test(
-            "Arbitrage Opportunities", 
-            "GET",
-            "api/opportunities",
-            200
-        )
-        
-        if success:
-            if isinstance(response, list):
-                print(f"   Found {len(response)} opportunities")
-                for i, opp in enumerate(response[:3]):  # Show first 3
-                    print(f"   Opp {i+1}: {opp.get('token_pair', 'N/A')} - "
-                          f"Spread: {opp.get('spread_percent', 0):.3f}% - "
-                          f"Net Profit: ${opp.get('net_profit_usd', 0):.2f}")
-            else:
-                print(f"   ⚠️ WARNING: Expected list, got {type(response)}")
-        
-        return success
-
-    def test_gas_price_endpoint(self):
-        """Test gas price endpoint"""
-        success, response = self.run_test(
-            "Gas Price Information",
-            "GET", 
-            "api/gas-price",
-            200
-        )
-        
-        if success:
-            gas_gwei = response.get('gwei', 0)
-            print(f"   Current Gas: {gas_gwei} gwei")
-            
-            recommended = response.get('recommended', {})
-            if recommended:
-                print(f"   Recommended: {recommended}")
-        
-        return success
-
-    def test_tokens_endpoint(self):
-        """Test supported tokens endpoint"""
-        success, response = self.run_test(
-            "Supported Tokens List",
-            "GET",
-            "api/tokens", 
-            200
-        )
-        
-        if success:
-            if isinstance(response, list):
-                print(f"   Found {len(response)} supported tokens")
-                for token in response[:5]:  # Show first 5
-                    print(f"   - {token.get('symbol', 'N/A')}: {token.get('address', 'N/A')[:10]}...")
-            else:
-                print(f"   ⚠️ WARNING: Expected list, got {type(response)}")
-        
-        return success
-
-    def test_wallet_balances_endpoint(self):
-        """Test wallet balances endpoint"""
-        success, response = self.run_test(
-            "Wallet Balances",
-            "GET",
-            f"api/wallet/{self.mock_wallet}/balances",
-            200
-        )
-        
-        if success:
-            balances = response.get('balances', [])
-            print(f"   Found {len(balances)} token balances")
-            for balance in balances[:3]:  # Show first 3
-                symbol = balance.get('symbol', 'N/A')
-                formatted = balance.get('balance_formatted', '0')
-                print(f"   - {symbol}: {formatted}")
-        
-        return success
-
-    def test_settings_endpoints(self):
-        """Test settings get/post endpoints"""
-        # Test GET settings
-        get_success, get_response = self.run_test(
-            "Get User Settings",
-            "GET",
-            f"api/settings/{self.mock_wallet}",
-            200
-        )
-        
-        if get_success:
-            print(f"   Min Profit Threshold: ${get_response.get('min_profit_threshold', 0)}")
-            print(f"   Max Slippage: {get_response.get('max_slippage', 0)}%")
-            print(f"   Auto Execute: {get_response.get('auto_execute', False)}")
-        
-        # Test POST settings
-        test_settings = {
-            "min_profit_threshold": 1.0,
-            "max_slippage": 0.8,
-            "gas_multiplier": 1.3,
-            "auto_execute": False
-        }
-        
-        post_success, post_response = self.run_test(
-            "Update User Settings",
-            "POST",
-            f"api/settings/{self.mock_wallet}",
-            200,
-            data=test_settings
-        )
-        
-        return get_success and post_success
-
-    def test_analytics_endpoint(self):
-        """Test analytics endpoint"""
-        success, response = self.run_test(
-            "Trading Analytics",
-            "GET",
-            f"api/analytics/{self.mock_wallet}",
-            200
-        )
-        
-        if success:
-            print(f"   Total Trades: {response.get('total_trades', 0)}")
-            print(f"   Total Profit: ${response.get('total_profit_usd', 0):.2f}")
-            print(f"   Success Rate: {response.get('success_rate', 0):.1f}%")
-        
-        return success
-
-    def test_root_endpoint(self):
-        """Test root API endpoint"""
-        success, response = self.run_test(
-            "Root API Endpoint",
-            "GET",
-            "api/",
-            200
-        )
-        
-        if success:
-            print(f"   Message: {response.get('message', 'N/A')}")
-            print(f"   Chain ID: {response.get('chain_id', 'N/A')}")
-        
-        return success
-
-    def test_execute_trade_validation(self):
-        """Test execute-trade endpoint input validation"""
-        print("\n🔧 Testing execute-trade endpoint validation...")
-        
-        # Test 1: Invalid pair format
-        invalid_pair_data = {
-            "pair": "INVALID",
-            "buy_dex": "Kodiak V2",
-            "sell_dex": "BEX", 
-            "amount": "100000000000000000000",
-            "slippage": 0.5,
-            "wallet_address": self.mock_wallet
-        }
-        
-        success1, response1 = self.run_test(
-            "Execute Trade - Invalid Pair Format",
-            "POST",
-            "api/execute-trade",
-            400,
-            data=invalid_pair_data
-        )
-        
-        # Test 2: Invalid wallet address
-        invalid_wallet_data = {
-            "pair": "WBERA/HONEY",
-            "buy_dex": "Kodiak V2", 
-            "sell_dex": "BEX",
-            "amount": "100000000000000000000",
-            "slippage": 0.5,
-            "wallet_address": "invalid_address"
-        }
-        
-        success2, response2 = self.run_test(
-            "Execute Trade - Invalid Wallet Address",
-            "POST", 
-            "api/execute-trade",
-            400,
-            data=invalid_wallet_data
-        )
-        
-        # Test 3: Excessive slippage
-        high_slippage_data = {
-            "pair": "WBERA/HONEY",
-            "buy_dex": "Kodiak V2",
-            "sell_dex": "BEX",
-            "amount": "100000000000000000000", 
-            "slippage": 10.0,  # Above MAX_SLIPPAGE_PERCENT (5%)
-            "wallet_address": self.mock_wallet
-        }
-        
-        success3, response3 = self.run_test(
-            "Execute Trade - Excessive Slippage",
-            "POST",
-            "api/execute-trade", 
-            200,  # Should return 200 but with success=false
-            data=high_slippage_data
-        )
-        
-        if success3 and not response3.get('success', True):
-            print(f"   ✅ Correctly rejected high slippage: {response3.get('error', '')}")
-        
-        return success1 and success2 and success3
-
-    def test_execute_trade_safety_checks(self):
-        """Test execute-trade endpoint safety checks"""
-        print("\n🛡️ Testing execute-trade safety checks...")
-        
-        # Test 1: Trade size limit
-        large_trade_data = {
-            "pair": "WBERA/HONEY",
-            "buy_dex": "Kodiak V2",
-            "sell_dex": "BEX",
-            "amount": "10000000000000000000000",  # Very large amount 
-            "slippage": 0.5,
-            "wallet_address": self.mock_wallet
-        }
-        
-        success1, response1 = self.run_test(
-            "Execute Trade - Large Trade Size Safety Check",
-            "POST",
-            "api/execute-trade",
-            200,
-            data=large_trade_data
-        )
-        
-        if success1:
-            if not response1.get('success', True):
-                print(f"   ✅ Safety check passed: {response1.get('error', '')}")
-            else:
-                print(f"   ⚠️ Large trade was allowed: {response1}")
-        
-        # Test 2: Valid trade request (should pass all checks)
-        valid_trade_data = {
-            "pair": "WBERA/HONEY",
-            "buy_dex": "Kodiak V2", 
-            "sell_dex": "BEX",
-            "amount": "100000000000000000000",  # 100 WBERA
-            "slippage": 0.5,
-            "wallet_address": self.mock_wallet
-        }
-        
-        success2, response2 = self.run_test(
-            "Execute Trade - Valid Request Structure",
-            "POST",
-            "api/execute-trade",
-            200,
-            data=valid_trade_data
-        )
-        
-        if success2:
-            print(f"   Response keys: {list(response2.keys())}")
-            
-            # Check required response fields
-            required_fields = ['success', 'execution_id']
-            for field in required_fields:
-                if field in response2:
-                    print(f"   ✅ Has {field}: {response2[field]}")
+            async with self.session.request(method, url, **kwargs) as response:
+                if response.content_type == 'application/json':
+                    data = await response.json()
                 else:
-                    print(f"   ❌ Missing {field}")
-            
-            # If trade verification passed, check profit calculations
-            if response2.get('success', False):
-                verification = response2.get('verification', {})
-                if verification:
-                    print(f"   Net Profit: ${verification.get('net_profit_usd', 0):.4f}")
-                    print(f"   Gas Cost: ${verification.get('gas_cost_usd', 0):.4f}")
-                    print(f"   Raw Profit: ${verification.get('raw_profit_usd', 0):.4f}")
-                    print(f"   Spread: {verification.get('spread_percent', 0):.3f}%")
-            else:
-                print(f"   Trade rejected: {response2.get('error', 'Unknown reason')}")
-        
-        return success1 and success2
-
-    def test_quote_endpoint(self):
-        """Test quote endpoint for price fetching"""
-        success, response = self.run_test(
-            "DEX Quote Endpoint",
-            "GET",
-            "api/quote?token_in=0x6969696969696969696969696969696969696969&token_out=0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce&amount_in=100000000000000000000&dex=kodiak",
-            200
-        )
-        
-        if success:
-            print(f"   DEX: {response.get('dex', 'N/A')}")
-            print(f"   Token In: {response.get('token_in', 'N/A')}")
-            print(f"   Token Out: {response.get('token_out', 'N/A')}")
-            print(f"   Price: {response.get('price', 0)}")
-            print(f"   Amount Out: {response.get('amount_out', 'N/A')}")
-        
-        return success
-
-    def test_engine_stats_endpoint(self):
-        """Test engine stats endpoint"""
-        success, response = self.run_test(
-            "Trading Engine Statistics",
-            "GET",
-            "api/engine/stats",
-            200
-        )
-        
-        if success:
-            cache_info = response.get('cache', {})
-            auto_engine_info = response.get('auto_engine', {})
-            safety_limits = response.get('safety_limits', {})
-            
-            print(f"   Pools Cached: {cache_info.get('pools_cached', 0)}")
-            print(f"   Pairs Cached: {cache_info.get('pairs_cached', 0)}")
-            print(f"   Gas Price: {cache_info.get('gas_price', 0)} gwei")
-            print(f"   Auto Engine Enabled: {auto_engine_info.get('enabled', False)}")
-            print(f"   Max Trade Size: ${safety_limits.get('max_trade_size_usd', 0)}")
-            print(f"   Min Profit Threshold: ${safety_limits.get('min_profit_threshold', 0)}")
-        
-        return success
-
-    def test_honeypot_check_endpoint(self):
-        """Test honeypot detection endpoint"""
-        # Test with HONEY token (should be safe)
-        honey_token = "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce"
-        
-        success, response = self.run_test(
-            "Honeypot Detection - HONEY Token",
-            "GET",
-            f"api/honeypot/check/{honey_token}",
-            200
-        )
-        
-        if success:
-            is_honeypot = response.get('is_honeypot', True)
-            reason = response.get('reason', 'N/A')
-            tax_percent = response.get('tax_percent', 0)
-            
-            print(f"   Is Honeypot: {is_honeypot}")
-            print(f"   Reason: {reason}")
-            if not is_honeypot and tax_percent is not None:
-                print(f"   Tax Percent: {tax_percent:.2f}%")
-        
-        return success
-
-    def test_auto_execute_status_endpoint(self):
-        """Test auto-execution status endpoint"""
-        success, response = self.run_test(
-            "Auto-Execution Engine Status",
-            "GET",
-            "api/auto-execute/status",
-            200
-        )
-        
-        if success:
-            print(f"   Enabled: {response.get('enabled', False)}")
-            print(f"   Wallet Address: {response.get('wallet_address', 'None')}")
-            print(f"   Min Profit: ${response.get('min_profit', 0)}")
-            print(f"   Max Slippage: {response.get('max_slippage', 0)}%")
-            print(f"   Execution Count: {response.get('execution_count', 0)}")
-            print(f"   Total Profit: ${response.get('total_profit', 0)}")
-        
-        return success
-
-    def test_pool_reserves_endpoint(self):
-        """Test pool reserves endpoint"""
-        # Test WBERA/HONEY pool
-        wbera = "0x6969696969696969696969696969696969696969"
-        honey = "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce"
-        
-        success, response = self.run_test(
-            "Pool Reserves - WBERA/HONEY",
-            "GET",
-            f"api/pool/reserves?token_a={wbera}&token_b={honey}",
-            200
-        )
-        
-        if success:
-            print(f"   Pair Address: {response.get('pair_address', 'N/A')[:20]}...")
-            print(f"   Reserve A: {response.get('reserve_a', 'N/A')}")
-            print(f"   Reserve B: {response.get('reserve_b', 'N/A')}")
-            if 'reserve_a_formatted' in response:
-                print(f"   Reserve A (formatted): {response['reserve_a_formatted']:.2f}")
-                print(f"   Reserve B (formatted): {response['reserve_b_formatted']:.2f}")
-        
-        return success
-
-def main():
-    print("🚀 Starting BeraArb API Testing...")
-    print("=" * 60)
-    
-    tester = BerachainArbBotAPITester()
-    
-    # List of core API tests to run
-    api_tests = [
-        tester.test_root_endpoint,
-        tester.test_health_endpoint,
-        tester.test_opportunities_endpoint,
-        tester.test_gas_price_endpoint,
-        tester.test_tokens_endpoint,
-        tester.test_wallet_balances_endpoint,
-        tester.test_analytics_endpoint,
-        tester.test_settings_endpoints,
-        tester.test_quote_endpoint,
-        tester.test_engine_stats_endpoint,
-        tester.test_honeypot_check_endpoint,
-        tester.test_auto_execute_status_endpoint,
-        tester.test_pool_reserves_endpoint,
-        tester.test_execute_trade_validation,
-        tester.test_execute_trade_safety_checks,
-    ]
-    
-    # Run all tests
-    for test_func in api_tests:
-        try:
-            test_func()
+                    text = await response.text()
+                    data = {"raw_response": text}
+                
+                return {
+                    "status_code": response.status,
+                    "data": data,
+                    "headers": dict(response.headers),
+                    "url": url
+                }
         except Exception as e:
-            print(f"❌ FAILED - Exception: {str(e)}")
-            tester.failed_tests.append({
-                "name": test_func.__name__,
-                "endpoint": "N/A",
-                "expected": "No Exception", 
-                "actual": "Exception",
-                "error": str(e)
-            })
+            return {
+                "status_code": 0,
+                "error": str(e),
+                "url": url
+            }
     
-    # Print final results
-    print("\n" + "=" * 60)
-    print(f"📊 TEST SUMMARY")
-    print(f"Tests Run: {tester.tests_run}")
-    print(f"Tests Passed: {tester.tests_passed}")
-    print(f"Tests Failed: {len(tester.failed_tests)}")
-    print(f"Success Rate: {(tester.tests_passed/tester.tests_run*100):.1f}%" if tester.tests_run > 0 else "N/A")
+    def log_test(self, test_name: str, success: bool, details: Dict = None, error: str = None):
+        """Log test result"""
+        result = {
+            "test": test_name,
+            "success": success,
+            "timestamp": time.time()
+        }
+        if details:
+            result["details"] = details
+        if error:
+            result["error"] = error
+        
+        self.results.append(result)
+        
+        status = "✅ PASS" if success else "❌ FAIL"
+        print(f"{status}: {test_name}")
+        if error:
+            print(f"   Error: {error}")
+        if details and not success:
+            print(f"   Details: {details}")
+        print()
     
-    if tester.failed_tests:
-        print("\n❌ FAILED TESTS:")
-        for i, failure in enumerate(tester.failed_tests, 1):
-            print(f"{i}. {failure['name']}")
-            print(f"   Endpoint: {failure['endpoint']}")
-            print(f"   Expected: {failure['expected']}, Got: {failure['actual']}")
-            print(f"   Error: {failure['error']}")
+    async def test_health_endpoint(self):
+        """Test GET /api/health - Verify RPC connection status"""
+        print("Testing Health Endpoint...")
+        
+        resp = await self.make_request("GET", "/health")
+        
+        if resp["status_code"] != 200:
+            self.log_test("Health Check", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Check required fields
+        required_fields = ["status", "rpc_connected", "block_number", "chain_id"]
+        missing_fields = [f for f in required_fields if f not in data]
+        
+        if missing_fields:
+            self.log_test("Health Check", False, data, f"Missing fields: {missing_fields}")
+            return
+        
+        # Check RPC connection
+        if not data["rpc_connected"]:
+            self.log_test("Health Check", False, data, "RPC not connected")
+            return
+        
+        # Check chain ID (should be Berachain: 80094)
+        if data["chain_id"] != 80094:
+            self.log_test("Health Check", False, data, f"Unexpected chain_id: {data['chain_id']}")
+            return
+        
+        # Check block number is positive
+        if data["block_number"] <= 0:
+            self.log_test("Health Check", False, data, f"Invalid block_number: {data['block_number']}")
+            return
+        
+        self.log_test("Health Check", True, {
+            "status": data["status"],
+            "rpc_connected": data["rpc_connected"],
+            "block_number": data["block_number"],
+            "chain_id": data["chain_id"]
+        })
     
-    return 0 if len(tester.failed_tests) == 0 else 1
+    async def test_engine_stats_endpoint(self):
+        """Test GET /api/engine/stats - Verify production metrics are included"""
+        print("Testing Engine Stats Endpoint...")
+        
+        resp = await self.make_request("GET", "/engine/stats")
+        
+        if resp["status_code"] != 200:
+            self.log_test("Engine Stats", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Check for production-specific sections
+        required_sections = ["production", "safety_limits", "arb_logger"]
+        missing_sections = [s for s in required_sections if s not in data]
+        
+        if missing_sections:
+            self.log_test("Engine Stats", False, data, f"Missing sections: {missing_sections}")
+            return
+        
+        # Verify production section
+        production = data["production"]
+        required_prod_fields = ["mode", "atomic_executor_stats", "scanner_metrics"]
+        missing_prod_fields = [f for f in required_prod_fields if f not in production]
+        
+        if missing_prod_fields:
+            self.log_test("Engine Stats", False, production, f"Missing production fields: {missing_prod_fields}")
+            return
+        
+        # Verify atomic executor stats
+        executor_stats = production["atomic_executor_stats"]
+        required_executor_fields = ["total_executions", "successful", "failed"]
+        missing_executor_fields = [f for f in required_executor_fields if f not in executor_stats]
+        
+        if missing_executor_fields:
+            self.log_test("Engine Stats", False, executor_stats, f"Missing executor fields: {missing_executor_fields}")
+            return
+        
+        # Verify scanner metrics  
+        scanner_metrics = production["scanner_metrics"]
+        required_scanner_fields = ["total_scans", "scan_errors", "last_scan_time_ms"]
+        missing_scanner_fields = [f for f in required_scanner_fields if f not in scanner_metrics]
+        
+        if missing_scanner_fields:
+            self.log_test("Engine Stats", False, scanner_metrics, f"Missing scanner fields: {missing_scanner_fields}")
+            return
+        
+        self.log_test("Engine Stats", True, {
+            "production_mode": production["mode"],
+            "total_executions": executor_stats["total_executions"],
+            "total_scans": scanner_metrics["total_scans"],
+            "error_rate": scanner_metrics.get("error_rate", 0)
+        })
+    
+    async def test_production_scan_endpoint(self):
+        """Test GET /api/production/scan-real - Test multicall-based scanner with real on-chain data"""
+        print("Testing Production Scan Endpoint...")
+        
+        resp = await self.make_request("GET", "/production/scan-real")
+        
+        if resp["status_code"] != 200:
+            self.log_test("Production Scan", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Check for required fields
+        required_fields = ["opportunities", "count", "scan_metrics"]
+        missing_fields = [f for f in required_fields if f not in data]
+        
+        if missing_fields:
+            self.log_test("Production Scan", False, data, f"Missing fields: {missing_fields}")
+            return
+        
+        # Verify scan metrics
+        scan_metrics = data["scan_metrics"]
+        required_metrics = ["total_scans", "last_scan_time_ms", "error_rate"]
+        missing_metrics = [m for m in required_metrics if m not in scan_metrics]
+        
+        if missing_metrics:
+            self.log_test("Production Scan", False, scan_metrics, f"Missing metrics: {missing_metrics}")
+            return
+        
+        # Verify scan time is reasonable (< 5 seconds)
+        scan_time_ms = scan_metrics["last_scan_time_ms"]
+        if scan_time_ms > 5000:
+            self.log_test("Production Scan", False, scan_metrics, f"Scan too slow: {scan_time_ms}ms")
+            return
+        
+        # Check that opportunities is a list
+        if not isinstance(data["opportunities"], list):
+            self.log_test("Production Scan", False, data, "Opportunities should be a list")
+            return
+        
+        # Verify count matches opportunities length
+        if data["count"] != len(data["opportunities"]):
+            self.log_test("Production Scan", False, data, "Count doesn't match opportunities length")
+            return
+        
+        self.log_test("Production Scan", True, {
+            "opportunities_found": data["count"],
+            "scan_time_ms": scan_time_ms,
+            "total_scans": scan_metrics["total_scans"],
+            "error_rate": scan_metrics["error_rate"]
+        })
+    
+    async def test_production_execution_stats_endpoint(self):
+        """Test GET /api/production/execution-stats - Verify executor and scanner stats"""
+        print("Testing Production Execution Stats Endpoint...")
+        
+        resp = await self.make_request("GET", "/production/execution-stats")
+        
+        if resp["status_code"] != 200:
+            self.log_test("Production Execution Stats", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Check for required fields
+        required_fields = ["atomic_executor", "scanner", "production_mode"]
+        missing_fields = [f for f in required_fields if f not in data]
+        
+        if missing_fields:
+            self.log_test("Production Execution Stats", False, data, f"Missing fields: {missing_fields}")
+            return
+        
+        # Verify atomic executor stats
+        executor_stats = data["atomic_executor"]
+        required_executor_fields = ["total_executions", "successful", "failed"]
+        missing_executor_fields = [f for f in required_executor_fields if f not in executor_stats]
+        
+        if missing_executor_fields:
+            self.log_test("Production Execution Stats", False, executor_stats, f"Missing executor fields: {missing_executor_fields}")
+            return
+        
+        # Verify scanner stats
+        scanner_stats = data["scanner"]
+        required_scanner_fields = ["total_scans", "scan_errors"]
+        missing_scanner_fields = [f for f in required_scanner_fields if f not in scanner_stats]
+        
+        if missing_scanner_fields:
+            self.log_test("Production Execution Stats", False, scanner_stats, f"Missing scanner fields: {missing_scanner_fields}")
+            return
+        
+        self.log_test("Production Execution Stats", True, {
+            "total_executions": executor_stats["total_executions"],
+            "success_rate": f"{executor_stats['successful']}/{executor_stats['total_executions']}",
+            "total_scans": scanner_stats["total_scans"],
+            "production_mode": data["production_mode"]
+        })
+    
+    async def test_check_allowance_endpoint(self):
+        """Test GET /api/production/check-allowance - Test allowance checking"""
+        print("Testing Check Allowance Endpoint...")
+        
+        # Test with HONEY token, Kodiak V2 router, and a test address
+        token_address = "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce"  # HONEY
+        spender_address = "0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022"  # Kodiak V2 Router
+        owner_address = "0x0000000000000000000000000000000000000001"  # Test address
+        
+        params = {
+            "token_address": token_address,
+            "spender_address": spender_address,
+            "owner_address": owner_address
+        }
+        
+        resp = await self.make_request("GET", "/production/check-allowance", params=params)
+        
+        if resp["status_code"] != 200:
+            self.log_test("Check Allowance", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Check for required fields
+        required_fields = ["allowance_raw", "allowance_formatted", "is_unlimited", "token_address", "spender", "owner"]
+        missing_fields = [f for f in required_fields if f not in data]
+        
+        if missing_fields:
+            self.log_test("Check Allowance", False, data, f"Missing fields: {missing_fields}")
+            return
+        
+        # Verify allowance is a valid number string
+        try:
+            int(data["allowance_raw"])
+        except ValueError:
+            self.log_test("Check Allowance", False, data, "Invalid allowance_raw format")
+            return
+        
+        # Verify boolean field
+        if not isinstance(data["is_unlimited"], bool):
+            self.log_test("Check Allowance", False, data, "is_unlimited should be boolean")
+            return
+        
+        self.log_test("Check Allowance", True, {
+            "allowance_raw": data["allowance_raw"],
+            "allowance_formatted": data["allowance_formatted"],
+            "is_unlimited": data["is_unlimited"]
+        })
+    
+    async def test_opportunities_endpoint(self):
+        """Test GET /api/opportunities - Test standard arbitrage scanning"""
+        print("Testing Standard Opportunities Endpoint...")
+        
+        resp = await self.make_request("GET", "/opportunities")
+        
+        if resp["status_code"] != 200:
+            self.log_test("Standard Opportunities", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Should be a list
+        if not isinstance(data, list):
+            self.log_test("Standard Opportunities", False, data, "Response should be a list")
+            return
+        
+        # If opportunities exist, verify structure
+        if data:
+            opp = data[0]
+            required_fields = ["id", "token_pair", "buy_dex", "sell_dex", "spread_percent", "net_profit_usd"]
+            missing_fields = [f for f in required_fields if f not in opp]
+            
+            if missing_fields:
+                self.log_test("Standard Opportunities", False, opp, f"Missing opportunity fields: {missing_fields}")
+                return
+            
+            # Verify numeric fields
+            try:
+                float(opp["spread_percent"])
+                float(opp["net_profit_usd"])
+            except (ValueError, TypeError):
+                self.log_test("Standard Opportunities", False, opp, "Invalid numeric fields")
+                return
+        
+        self.log_test("Standard Opportunities", True, {
+            "opportunities_count": len(data),
+            "has_opportunities": len(data) > 0
+        })
+    
+    async def test_triangular_opportunities_endpoint(self):
+        """Test GET /api/triangular-opportunities - Test triangular arbitrage detection"""
+        print("Testing Triangular Opportunities Endpoint...")
+        
+        resp = await self.make_request("GET", "/triangular-opportunities")
+        
+        if resp["status_code"] != 200:
+            self.log_test("Triangular Opportunities", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Check required fields
+        required_fields = ["base_token", "opportunities", "count"]
+        missing_fields = [f for f in required_fields if f not in data]
+        
+        if missing_fields:
+            self.log_test("Triangular Opportunities", False, data, f"Missing fields: {missing_fields}")
+            return
+        
+        # Verify count matches opportunities length
+        if data["count"] != len(data["opportunities"]):
+            self.log_test("Triangular Opportunities", False, data, "Count doesn't match opportunities length")
+            return
+        
+        # If opportunities exist, verify structure
+        opportunities = data["opportunities"]
+        if opportunities:
+            opp = opportunities[0]
+            required_opp_fields = ["type", "path", "net_profit_usd", "legs"]
+            missing_opp_fields = [f for f in required_opp_fields if f not in opp]
+            
+            if missing_opp_fields:
+                self.log_test("Triangular Opportunities", False, opp, f"Missing opportunity fields: {missing_opp_fields}")
+                return
+            
+            # Verify it's actually triangular
+            if opp["type"] != "triangular":
+                self.log_test("Triangular Opportunities", False, opp, f"Expected triangular type, got {opp['type']}")
+                return
+        
+        self.log_test("Triangular Opportunities", True, {
+            "base_token": data["base_token"],
+            "opportunities_count": data["count"],
+            "has_opportunities": data["count"] > 0
+        })
+    
+    async def test_gas_price_endpoint(self):
+        """Test GET /api/gas-price - Verify gas price endpoint"""
+        print("Testing Gas Price Endpoint...")
+        
+        resp = await self.make_request("GET", "/gas-price")
+        
+        if resp["status_code"] != 200:
+            self.log_test("Gas Price", False, resp, "Non-200 status code")
+            return
+        
+        data = resp["data"]
+        
+        # Check required fields
+        required_fields = ["wei", "gwei", "recommended"]
+        missing_fields = [f for f in required_fields if f not in data]
+        
+        if missing_fields:
+            self.log_test("Gas Price", False, data, f"Missing fields: {missing_fields}")
+            return
+        
+        # Verify recommended structure
+        recommended = data["recommended"]
+        required_rec_fields = ["slow", "standard", "fast", "instant"]
+        missing_rec_fields = [f for f in required_rec_fields if f not in recommended]
+        
+        if missing_rec_fields:
+            self.log_test("Gas Price", False, recommended, f"Missing recommended fields: {missing_rec_fields}")
+            return
+        
+        # Verify numeric values
+        try:
+            float(data["gwei"])
+            for tier in required_rec_fields:
+                float(recommended[tier])
+        except (ValueError, TypeError):
+            self.log_test("Gas Price", False, data, "Invalid numeric values")
+            return
+        
+        self.log_test("Gas Price", True, {
+            "gwei": data["gwei"],
+            "recommended_fast": recommended["fast"],
+            "has_error": "error" in data
+        })
+    
+    async def run_all_tests(self):
+        """Run all production endpoint tests"""
+        print("🚀 Starting Berachain Production Arbitrage Engine Backend Tests")
+        print(f"Backend URL: {self.base_url}")
+        print("=" * 80)
+        
+        start_time = time.time()
+        
+        # Test all production endpoints as specified in the review request
+        test_functions = [
+            self.test_health_endpoint,
+            self.test_engine_stats_endpoint,
+            self.test_production_scan_endpoint,
+            self.test_production_execution_stats_endpoint,
+            self.test_check_allowance_endpoint,
+            self.test_opportunities_endpoint,
+            self.test_triangular_opportunities_endpoint,
+            self.test_gas_price_endpoint
+        ]
+        
+        for test_func in test_functions:
+            try:
+                await test_func()
+            except Exception as e:
+                test_name = test_func.__name__.replace("test_", "").replace("_endpoint", "").title()
+                self.log_test(test_name, False, error=f"Test exception: {str(e)}")
+        
+        # Print summary
+        total_time = time.time() - start_time
+        passed = sum(1 for r in self.results if r["success"])
+        failed = len(self.results) - passed
+        
+        print("=" * 80)
+        print("🏁 TEST SUMMARY")
+        print("=" * 80)
+        print(f"✅ PASSED: {passed}")
+        print(f"❌ FAILED: {failed}")
+        print(f"⏱️  TOTAL TIME: {total_time:.2f}s")
+        print(f"📊 SUCCESS RATE: {(passed/len(self.results)*100):.1f}%")
+        print()
+        
+        # Print failed tests details
+        if failed > 0:
+            print("🔍 FAILED TESTS DETAILS:")
+            print("-" * 40)
+            for result in self.results:
+                if not result["success"]:
+                    print(f"❌ {result['test']}")
+                    if "error" in result:
+                        print(f"   Error: {result['error']}")
+                    print()
+        
+        # Return summary for test_result.md update
+        return {
+            "total": len(self.results),
+            "passed": passed,
+            "failed": failed,
+            "success_rate": passed/len(self.results)*100,
+            "duration": total_time,
+            "results": self.results
+        }
+
+async def main():
+    """Main test runner"""
+    async with BerachainArbEngineTest() as tester:
+        summary = await tester.run_all_tests()
+        return summary
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Run tests
+    try:
+        summary = asyncio.run(main())
+        
+        # Exit with non-zero code if any tests failed for CI/CD
+        if summary["failed"] > 0:
+            sys.exit(1)
+        else:
+            sys.exit(0)
+            
+    except KeyboardInterrupt:
+        print("\n🛑 Tests interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n💥 Test runner error: {e}")
+        sys.exit(1)
