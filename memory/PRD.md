@@ -3,50 +3,41 @@
 ## Project Overview
 Production-ready, institutional-grade arbitrage system for Berachain network. Full-stack application (React + FastAPI) capable of real-time trading with comprehensive safety checks.
 
-## Latest Update: Full System Intelligence Upgrade (March 2026)
+## Latest Update: Final Production Hardening (July 2025)
 
-### New Features Implemented
+### Production Features Implemented
 
-#### 1. Multi-Hop Arbitrage Detection
-- Support for 4+ token arbitrage routes (A → B → C → D → A)
-- `find_multi_hop_paths()` in PriceMatrix for route discovery
-- `find_multi_hop_arbitrage()` function for profit calculation
-- New endpoint: `GET /api/multi-hop-opportunities`
+#### 1. Real On-Chain Data Integration
+- **No mock data** - All prices fetched from actual DEX contracts
+- **Multicall3 batching** - Efficient batch RPC calls (<1s latency)
+- **Real-time reserves** - Live liquidity tracking from LP pairs
+- Supports Kodiak V2, Kodiak V3, and BEX
 
-#### 2. Micro-Arbitrage Capture (0.05%-0.2% spreads)
-- Lowered `MIN_SPREAD_THRESHOLD` to 0.05%
-- Lowered `MIN_PROFIT_THRESHOLD` to $0.0005
-- Lowered `MIN_LIQUIDITY_USD` to $200
-- Enhanced scanning to capture smaller spreads
+#### 2. Token Approval Flow
+- Automatic allowance checking before swaps
+- `MAX_UINT256` approval to avoid repeated transactions
+- Retry logic with exponential backoff
 
-#### 3. Advanced Opportunity Ranking
-- Risk-adjusted scoring algorithm:
-  - Net profit (35%)
-  - Risk score (25%): gas/profit ratio, price impact, type risk
-  - Liquidity (20%)
-  - Spread quality (10%): optimal 0.1-1%
-  - Execution probability (10%)
-- Each opportunity now includes `rank_score`, `risk_score`, `risk_adjusted_profit`, `execution_probability`
+#### 3. Atomic Execution Engine
+- Buy + Sell bundled as atomic operation
+- Pre-trade simulation via `eth_call`
+- Strict profit verification: `net_profit > gas + fees + slippage`
+- Max 3 retries with +20% gas escalation per retry
 
-#### 4. Pre-Trade On-Chain Simulation
-- `verify_profit_onchain()` validates profit before execution
-- `simulate_swap_onchain()` uses eth_call for safe simulation
-- Transactions rejected if simulated profit <= 0
-- Strict safety checks: profit must exceed gas cost
+#### 4. Flash Loan Support
+- Capital-efficient arbitrage using borrowed liquidity
+- Uniswap V2 style flash swaps
+- Repay within single transaction
 
-#### 5. Comprehensive Logging & Metrics (ArbLogger)
-- Tracks: opportunities_found, micro_arbs_found, triangular_found, multi_hop_found
-- Trade metrics: executed, failed, skipped with reasons
-- Profit tracking by pair
-- Simulation stats: passed, failed, success_rate
-- Scanning metrics: total_scans, avg_scan_time_ms, uptime
+#### 5. MEV Protection
+- Private RPC submission (Flashbots-style)
+- Front-running prevention
+- Configurable via `PRIVATE_RPC_URL`
 
-#### 6. Execution Reliability
-- Revert protection: reject trades if net_profit <= 0
-- Slippage protection with configurable tolerance
-- Gas buffer multiplier (1.3x)
-- Low liquidity pool avoidance
-- Trade size limits ($10,000 max)
+#### 6. Production Logging
+- CSV logging of all trade outcomes
+- MongoDB storage for trade history
+- Comprehensive metrics tracking
 
 ### API Endpoints
 
