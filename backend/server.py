@@ -34,10 +34,24 @@ from execution.atomic_executor import AtomicArbExecutor, TradeLogger
 from execution.flash_loan import FlashLoanExecutor
 from scanner.multicall_scanner import RealPriceScanner
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# MongoDB connection - fallback to mongomock if real MongoDB unavailable
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+db_name = os.environ.get('DB_NAME', 'bearb_db')
+try:
+    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=3000)
+    db = client[db_name]
+    logging.info(f"MongoDB connecting to: {mongo_url}")
+except Exception as _mongo_err:
+    logging.warning(f"MongoDB unavailable ({_mongo_err}), using in-memory mock")
+    try:
+        from mongomock_motor import AsyncMongoMockClient
+        client = AsyncMongoMockClient()
+        db = client[db_name]
+        logging.info("Using mongomock-motor in-memory database")
+    except ImportError:
+        logging.error("mongomock-motor not installed; DB operations will fail")
+        client = AsyncIOMotorClient(mongo_url)
+        db = client[db_name]
 
 # Berachain Configuration
 BERACHAIN_RPC = os.environ.get('BERACHAIN_RPC', 'https://rpc.berachain.com')
