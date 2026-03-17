@@ -140,6 +140,17 @@ FACTORY_ABI = json.loads('''[
     {"constant":true,"inputs":[{"name":"tokenA","type":"address"},{"name":"tokenB","type":"address"}],"name":"getPair","outputs":[{"name":"pair","type":"address"}],"type":"function"}
 ]''')
 
+# BEX CrocSwap Query ABI
+BEX_QUERY_ABI = json.loads('''[
+    {"inputs":[{"internalType":"address","name":"base","type":"address"},{"internalType":"address","name":"quote","type":"address"},{"internalType":"uint256","name":"poolIdx","type":"uint256"}],"name":"queryPrice","outputs":[{"internalType":"uint128","name":"","type":"uint128"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"base","type":"address"},{"internalType":"address","name":"quote","type":"address"},{"internalType":"uint256","name":"poolIdx","type":"uint256"},{"internalType":"bool","name":"isBuy","type":"bool"},{"internalType":"bool","name":"inBaseQty","type":"bool"},{"internalType":"uint128","name":"qty","type":"uint128"},{"internalType":"uint16","name":"tip","type":"uint16"},{"internalType":"uint128","name":"limitPrice","type":"uint128"},{"internalType":"uint128","name":"minOut","type":"uint128"},{"internalType":"uint8","name":"reserveFlags","type":"uint8"}],"name":"previewSwap","outputs":[{"internalType":"int128","name":"baseFlow","type":"int128"},{"internalType":"int128","name":"quoteFlow","type":"int128"}],"stateMutability":"view","type":"function"}
+]''')
+
+# BEX CrocSwap constants
+BEX_POOL_IDX = 36000
+BEX_MIN_SQRT_PRICE = 65536
+BEX_MAX_UINT128 = (2**128) - 1
+
 app = FastAPI(title="Berachain Arbitrage Bot")
 api_router = APIRouter(prefix="/api")
 
@@ -1148,6 +1159,60 @@ async def get_dex_quote_fast(router_address: str, token_in: str, token_out: str,
         logger.debug(f"DEX quote error ({dex_name}): {e}")
     return None
 
+async def get_bex_quote_fast(token_in: str, token_out: str, amount_in: int) -> Optional[PriceQuote]:
+    """Get price quote from BEX (CrocSwap) using previewSwap - proper interface"""
+    try:
+        bex_query_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(BEX_QUERY),
+            abi=BEX_QUERY_ABI
+        )
+        token_in_cs = Web3.to_checksum_address(token_in)
+        token_out_cs = Web3.to_checksum_address(token_out)
+
+        # CrocSwap: base is the lower address token
+        if int(token_in_cs, 16) < int(token_out_cs, 16):
+            base, quote_addr = token_in_cs, token_out_cs
+            is_buy = False      # Selling base
+            in_base_qty = True
+            limit_price = BEX_MIN_SQRT_PRICE
+        else:
+            base, quote_addr = token_out_cs, token_in_cs
+            is_buy = True       # Buying base with quote
+            in_base_qty = False
+            limit_price = BEX_MAX_UINT128
+
+        base_flow, quote_flow = bex_query_contract.functions.previewSwap(
+            base, quote_addr, BEX_POOL_IDX,
+            is_buy, in_base_qty, amount_in,
+            0, limit_price, 0, 0
+        ).call()
+
+        # We receive the token with negative flow (outflow from pool)
+        amount_out = abs(base_flow) if is_buy else abs(quote_flow)
+        if not (is_buy and base_flow < 0) and not (not is_buy and quote_flow < 0):
+            return None
+
+        token_in_info = next((t for t in TOKENS.values() if t["address"].lower() == token_in.lower()), None)
+        token_out_info = next((t for t in TOKENS.values() if t["address"].lower() == token_out.lower()), None)
+
+        if token_in_info and token_out_info:
+            amount_in_decimal = amount_in / (10 ** token_in_info["decimals"])
+            amount_out_decimal = amount_out / (10 ** token_out_info["decimals"])
+            price = amount_out_decimal / amount_in_decimal if amount_in_decimal > 0 else 0
+            return PriceQuote(
+                dex="BEX",
+                token_in=token_in_info["symbol"],
+                token_out=token_out_info["symbol"],
+                amount_in=str(amount_in),
+                amount_out=str(amount_out),
+                price=price,
+                price_impact=min(0.1 + (amount_in_decimal * 0.001), 5.0),
+                gas_estimate=180000
+            )
+    except Exception as e:
+        logger.debug(f"BEX quote error: {e}")
+    return None
+
 async def get_multicall_quotes(pairs: List[tuple], amount_in_map: Dict[str, int]) -> Dict[str, PriceQuote]:
     """Fetch multiple quotes using multicall for speed"""
     results = {}
@@ -1275,37 +1340,35 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         if price_impact > MAX_PRICE_IMPACT_PERCENT:
             continue
         
-        # Get REAL quote from second DEX
-        # Note: BEX uses CrocSwap interface - for now use Kodiak V3 for comparison
-        # TODO: Implement CrocSwap query interface for BEX when deployed
+        # Get quotes from both Kodiak V3 and BEX in parallel
+        v3_task = get_dex_quote_fast(
+            KODIAK_V3_ROUTER,
+            token_a_info["address"],
+            token_b_info["address"],
+            amount_in,
+            "Kodiak V3"
+        )
+        bex_task = get_bex_quote_fast(
+            token_a_info["address"],
+            token_b_info["address"],
+            amount_in
+        )
+        v3_result, bex_result = await asyncio.gather(v3_task, bex_task, return_exceptions=True)
+
+        # Collect all valid second-dex quotes and pick best arbitrage
+        second_dex_candidates = []
+        if isinstance(v3_result, PriceQuote):
+            second_dex_candidates.append(v3_result)
+        if isinstance(bex_result, PriceQuote):
+            second_dex_candidates.append(bex_result)
+
         second_dex_quote = None
-        second_dex_name = "Kodiak V3"
-        
-        try:
-            # Try Kodiak V3 first (different router, may have different prices)
-            second_dex_quote = await get_dex_quote_fast(
-                KODIAK_V3_ROUTER,
-                token_a_info["address"],
-                token_b_info["address"],
-                amount_in,
-                "Kodiak V3"
-            )
-        except Exception as v3_err:
-            logger.debug(f"Kodiak V3 quote error: {v3_err}")
-        
-        # If V3 failed, try BEX (CrocSwap interface)
-        if not second_dex_quote:
-            try:
-                second_dex_quote = await get_dex_quote_fast(
-                    BEX_ROUTER,
-                    token_a_info["address"],
-                    token_b_info["address"],
-                    amount_in,
-                    "BEX"
-                )
-                second_dex_name = "BEX"
-            except Exception as bex_err:
-                logger.debug(f"BEX quote error: {bex_err}")
+        best_spread = 0.0
+        for candidate in second_dex_candidates:
+            candidate_spread = abs(quote.price - candidate.price) / max(quote.price, candidate.price, 1e-18) * 100
+            if candidate_spread > best_spread:
+                best_spread = candidate_spread
+                second_dex_quote = candidate
         
         # If no second DEX quote available, skip this pair
         if not second_dex_quote:
@@ -2488,20 +2551,32 @@ async def scan_real_opportunities():
     Production scan using real on-chain data via Multicall.
     No mock data - all prices fetched from actual DEX contracts.
     """
+    # Fetch gas price with fallback
     try:
-        # Update gas price
         gas_price = w3.eth.gas_price
+    except Exception as e:
+        logger.warning(f"Gas price fetch failed, using fallback: {e}")
+        gas_price = int(1e9)  # 1 gwei fallback
+
+    # Fetch BERA price with fallback
+    try:
         bera_price = await get_token_price_coingecko("berachain-bera")
-        
+        if bera_price <= 0:
+            raise ValueError("Invalid price returned")
+    except Exception as e:
+        logger.warning(f"BERA price fetch failed, using cached fallback: {e}")
+        bera_price = price_cache.get("bera_price", 5.0)
+
+    try:
         # Use real price scanner
         opportunities = await real_price_scanner.scan_arbitrage_opportunities(
             gas_price_wei=gas_price,
             bera_price_usd=bera_price
         )
-        
+
         # Get scanner metrics
         metrics = real_price_scanner.get_scan_metrics()
-        
+
         return {
             "opportunities": opportunities,
             "count": len(opportunities),
@@ -2509,12 +2584,15 @@ async def scan_real_opportunities():
             "gas_price_gwei": gas_price / 10**9,
             "bera_price_usd": bera_price
         }
-        
+
     except Exception as e:
+        logger.error(f"Scan-real error: {e}")
         return {
             "error": str(e),
             "opportunities": [],
-            "count": 0
+            "count": 0,
+            "gas_price_gwei": gas_price / 10**9,
+            "bera_price_usd": bera_price
         }
 
 @api_router.get("/production/execution-stats")

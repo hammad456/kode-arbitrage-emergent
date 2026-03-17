@@ -20,6 +20,15 @@ from core.abis import (
     ROUTER_V2_ABI, MULTICALL_ABI, PAIR_ABI, FACTORY_ABI, BEX_QUERY_ABI
 )
 
+# BEX CrocSwap pool index (Berachain mainnet default)
+BEX_POOL_IDX = 36000
+# Min sqrt price for CrocSwap sell limit (no lower limit)
+BEX_MIN_SQRT_PRICE = 65536
+# Max uint128 for CrocSwap buy limit (no upper limit)
+BEX_MAX_UINT128 = (2**128) - 1
+# Cache TTL for reserves (seconds)
+RESERVES_CACHE_TTL = 12  # ~1 Berachain block time
+
 logger = logging.getLogger(__name__)
 
 
@@ -140,15 +149,22 @@ class RealPriceScanner:
         """Get reserves for multiple pairs using multicall"""
         if not pair_addresses:
             return {}
-        
+
+        now = time.time()
+
         try:
             calls = []
             valid_pairs = []
-            
+
             for pair_addr in pair_addresses:
                 if not pair_addr or pair_addr == "0x0000000000000000000000000000000000000000":
                     continue
-                
+
+                # Return cached reserves if still fresh
+                cached_ts = self.cache_timestamp.get(pair_addr, 0)
+                if pair_addr in self.reserves_cache and (now - cached_ts) < RESERVES_CACHE_TTL:
+                    continue
+
                 valid_pairs.append(pair_addr)
                 
                 # getReserves call
@@ -180,12 +196,78 @@ class RealPriceScanner:
                     except Exception:
                         pass
             
-            return reserves_map
-            
+            # Merge fresh results with still-valid cache entries
+            merged = dict(self.reserves_cache)
+            merged.update(reserves_map)
+            # Only return entries for the requested addresses
+            return {addr: merged[addr] for addr in pair_addresses if addr in merged}
+
         except Exception as e:
             logger.error(f"Batch get reserves error: {e}")
-            return {}
+            # Return whatever is in cache as fallback
+            return {addr: self.reserves_cache[addr] for addr in pair_addresses if addr in self.reserves_cache}
     
+    async def get_bex_quote(
+        self,
+        token_in: str,
+        token_out: str,
+        amount_in: int,
+        pool_idx: int = BEX_POOL_IDX
+    ) -> Optional[int]:
+        """
+        Get quote from BEX (CrocSwap) using previewSwap.
+        CrocSwap requires tokens ordered by address (base < quote).
+        Returns amount_out on success, None on failure.
+        """
+        try:
+            bex_query_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(BEX_QUERY),
+                abi=BEX_QUERY_ABI
+            )
+
+            token_in_cs = Web3.to_checksum_address(token_in)
+            token_out_cs = Web3.to_checksum_address(token_out)
+
+            # CrocSwap: base is the lower address token
+            if int(token_in_cs, 16) < int(token_out_cs, 16):
+                # token_in is base, token_out is quote
+                # Selling base (isBuy=False), qty in base units
+                base, quote = token_in_cs, token_out_cs
+                is_buy = False
+                in_base_qty = True
+                limit_price = BEX_MIN_SQRT_PRICE  # sell: no lower price limit
+            else:
+                # token_in is quote, token_out is base
+                # Buying base with quote (isBuy=True), qty in quote units
+                base, quote = token_out_cs, token_in_cs
+                is_buy = True
+                in_base_qty = False
+                limit_price = BEX_MAX_UINT128  # buy: no upper price limit
+
+            base_flow, quote_flow = bex_query_contract.functions.previewSwap(
+                base,
+                quote,
+                pool_idx,
+                is_buy,
+                in_base_qty,
+                amount_in,
+                0,            # tip
+                limit_price,
+                0,            # minOut
+                0             # reserveFlags
+            ).call()
+
+            if is_buy:
+                # We receive base (token_out); base_flow is negative (outflow from pool to us)
+                return abs(base_flow) if base_flow < 0 else None
+            else:
+                # We receive quote (token_out); quote_flow is negative (outflow from pool to us)
+                return abs(quote_flow) if quote_flow < 0 else None
+
+        except Exception as e:
+            logger.debug(f"BEX previewSwap error: {e}")
+            return None
+
     async def batch_get_quotes(
         self,
         quote_requests: List[Dict]
@@ -204,51 +286,79 @@ class RealPriceScanner:
         """
         if not quote_requests:
             return []
-        
-        try:
-            calls = []
-            
-            for req in quote_requests:
-                router_addr = req["router"]
-                path = [
-                    Web3.to_checksum_address(req["token_in"]),
-                    Web3.to_checksum_address(req["token_out"])
-                ]
-                
-                router = self.w3.eth.contract(
-                    address=Web3.to_checksum_address(router_addr),
-                    abi=ROUTER_V2_ABI
+
+        # Separate BEX (CrocSwap) requests from standard V2 requests
+        bex_indices = []
+        v2_indices = []
+        for i, req in enumerate(quote_requests):
+            if req["router"].lower() == BEX_ROUTER.lower():
+                bex_indices.append(i)
+            else:
+                v2_indices.append(i)
+
+        quotes: List[Optional[Dict]] = [None] * len(quote_requests)
+
+        # --- Handle standard V2 routers via multicall ---
+        if v2_indices:
+            try:
+                calls = []
+                for i in v2_indices:
+                    req = quote_requests[i]
+                    router_addr = req["router"]
+                    path = [
+                        Web3.to_checksum_address(req["token_in"]),
+                        Web3.to_checksum_address(req["token_out"])
+                    ]
+                    router = self.w3.eth.contract(
+                        address=Web3.to_checksum_address(router_addr),
+                        abi=ROUTER_V2_ABI
+                    )
+                    calldata = router.encode_abi('getAmountsOut', args=[req["amount_in"], path])
+                    calls.append((router_addr, True, calldata))
+
+                results = self.multicall.functions.aggregate3(calls).call()
+
+                for j, orig_idx in enumerate(v2_indices):
+                    if results[j][0]:
+                        try:
+                            amounts = decode(['uint256[]'], results[j][1])[0]
+                            quotes[orig_idx] = {
+                                "amount_in": quote_requests[orig_idx]["amount_in"],
+                                "amount_out": amounts[-1],
+                                "router": quote_requests[orig_idx]["router"],
+                                "success": True
+                            }
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.error(f"Batch V2 quotes error: {e}")
+
+        # --- Handle BEX (CrocSwap) via previewSwap ---
+        if bex_indices:
+            bex_tasks = [
+                self.get_bex_quote(
+                    quote_requests[i]["token_in"],
+                    quote_requests[i]["token_out"],
+                    quote_requests[i]["amount_in"]
                 )
-                calldata = router.encode_abi(
-                    'getAmountsOut',
-                    args=[req["amount_in"], path]
-                )
-                calls.append((router_addr, True, calldata))
-            
-            # Execute multicall
-            results = self.multicall.functions.aggregate3(calls).call()
-            
-            quotes = []
-            for i, result in enumerate(results):
-                if result[0]:  # success
-                    try:
-                        amounts = decode(['uint256[]'], result[1])[0]
-                        quotes.append({
-                            "amount_in": quote_requests[i]["amount_in"],
-                            "amount_out": amounts[-1],
-                            "router": quote_requests[i]["router"],
+                for i in bex_indices
+            ]
+            try:
+                import asyncio as _asyncio
+                bex_results = await _asyncio.gather(*bex_tasks, return_exceptions=True)
+                for j, orig_idx in enumerate(bex_indices):
+                    amount_out = bex_results[j]
+                    if isinstance(amount_out, int) and amount_out > 0:
+                        quotes[orig_idx] = {
+                            "amount_in": quote_requests[orig_idx]["amount_in"],
+                            "amount_out": amount_out,
+                            "router": BEX_ROUTER,
                             "success": True
-                        })
-                    except Exception:
-                        quotes.append(None)
-                else:
-                    quotes.append(None)
-            
-            return quotes
-            
-        except Exception as e:
-            logger.error(f"Batch get quotes error: {e}")
-            return [None] * len(quote_requests)
+                        }
+            except Exception as e:
+                logger.error(f"BEX quotes error: {e}")
+
+        return quotes
     
     async def scan_arbitrage_opportunities(
         self,

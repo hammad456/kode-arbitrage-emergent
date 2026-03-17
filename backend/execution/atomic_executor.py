@@ -17,7 +17,8 @@ from core.constants import (
     GAS_BUFFER_MULTIPLIER, MAX_GAS_LIMIT, DEX_FEE_PERCENT,
     TRADE_TIMEOUT_SECONDS, PRIVATE_RPC_URL, KODIAK_V2_ROUTER, BEX_ROUTER
 )
-from core.abis import ROUTER_V2_ABI, ERC20_ABI
+from core.abis import ROUTER_V2_ABI, ERC20_ABI, BEX_QUERY_ABI
+from core.constants import BEX_QUERY
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,18 @@ class AtomicArbExecutor:
             "total_gas_spent_usd": 0.0
         }
     
+    def get_token_balance(self, token_address: str, wallet_address: str) -> int:
+        """Get current ERC20 token balance for wallet"""
+        try:
+            token = self.w3.eth.contract(
+                address=Web3.to_checksum_address(token_address),
+                abi=ERC20_ABI
+            )
+            return token.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+        except Exception as e:
+            logger.warning(f"Balance check failed for {token_address}: {e}")
+            return 0
+
     async def simulate_swap(
         self,
         router_address: str,
@@ -190,8 +203,21 @@ class AtomicArbExecutor:
             result["sell_output"] = sell_output
             
             # Calculate costs
-            # Gas cost for 2 swaps
-            total_gas = 300000 * 2  # Conservative estimate
+            # Gas cost: try to estimate dynamically, fallback to 250k per swap
+            try:
+                buy_router_contract = self.w3.eth.contract(
+                    address=Web3.to_checksum_address(buy_router),
+                    abi=ROUTER_V2_ABI
+                )
+                buy_path_cs = [Web3.to_checksum_address(a) for a in buy_path]
+                buy_gas_est = buy_router_contract.functions.swapExactTokensForTokens(
+                    amount_in, 0, buy_path_cs,
+                    Web3.to_checksum_address("0x0000000000000000000000000000000000000001"),
+                    int(time.time()) + 300
+                ).estimate_gas({'from': Web3.to_checksum_address("0x0000000000000000000000000000000000000001")})
+                total_gas = int(buy_gas_est * 2 * GAS_BUFFER_MULTIPLIER)
+            except Exception:
+                total_gas = 250000 * 2  # Realistic estimate (was 300k, tuned down)
             gas_cost_usd = (total_gas * gas_price_wei / 10**18) * bera_price_usd
             result["gas_cost_usd"] = gas_cost_usd
             
@@ -441,11 +467,22 @@ class AtomicArbExecutor:
                 return result
             
             result["total_gas_used"] += buy_result["gas_used"]
-            
+
             # Execute Sell: token_out -> token_in
-            # Use actual output from buy as input for sell
-            sell_amount_in = verification["buy_output"]  # Use simulated amount
-            
+            # Use ACTUAL token balance after buy (not simulated amount)
+            # This handles slippage differences between simulation and real execution
+            actual_token_out_balance = self.get_token_balance(
+                token_out_info["address"], wallet_address
+            )
+            sell_amount_in = actual_token_out_balance if actual_token_out_balance > 0 else verification["buy_output"]
+            if actual_token_out_balance <= 0:
+                logger.warning("Could not read actual balance after buy; using simulated amount")
+
+            # Recalculate sell_amount_out_min based on actual sell_amount_in
+            sell_amount_out_min = int(
+                (sell_amount_in / max(verification["buy_output"], 1)) * verification["sell_output"] * slippage_factor
+            )
+
             sell_result = await self.execute_swap(
                 router_address=sell_router,
                 amount_in=sell_amount_in,
