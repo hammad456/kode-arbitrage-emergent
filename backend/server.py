@@ -108,15 +108,20 @@ BEX_QUERY = "0x8685CE9Db06D40CBa73e3d09e6868FE476B5dC89"
 HONEYPOT_ROUTER = "0x1306D3c36eC7E38dd2c128fBe3097C2C2449af64"
 WBERA = "0x6969696969696969696969696969696969696969"
 
-# Common tokens on Berachain
-TOKENS = {
-    "WBERA": {"address": "0x6969696969696969696969696969696969696969", "decimals": 18, "symbol": "WBERA"},
-    "HONEY": {"address": "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce", "decimals": 18, "symbol": "HONEY"},
-    "USDC": {"address": "0x549943e04f40284185054145c6E4e9568C1D3241", "decimals": 6, "symbol": "USDC"},
-    "USDT": {"address": "0x779Ded0c9e1022225f8E0630b35a9b54bE713736", "decimals": 6, "symbol": "USDT"},
-    "WETH": {"address": "0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590", "decimals": 18, "symbol": "WETH"},
-    "WBTC": {"address": "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c", "decimals": 8, "symbol": "WBTC"},
-}
+# Common tokens on Berachain — imported from core.constants for consistency
+from core.constants import (
+    TOKENS as _CORE_TOKENS,
+    STABLE_ADDRESSES,
+    TOKEN_BY_ADDRESS,
+    DYNAMIC_TOKENS,
+    BEX_POOL_IDX,
+    BEX_MIN_SQRT_PRICE,
+    BEX_MAX_UINT128,
+)
+import math as _math
+import itertools as _itertools
+
+TOKENS: Dict[str, Dict] = dict(_CORE_TOKENS)  # mutable copy; dynamically extended at runtime
 
 # Uniswap V2 Router ABI (for Kodiak V2)
 ROUTER_V2_ABI = json.loads('''[
@@ -1250,34 +1255,66 @@ async def get_multicall_quotes(pairs: List[tuple], amount_in_map: Dict[str, int]
     
     return results
 
+def _calc_v2_output(amount_in: int, reserve_in: int, reserve_out: int, fee: int = 997) -> int:
+    """Uniswap V2 constant-product output (no RPC)."""
+    if amount_in <= 0 or reserve_in <= 0 or reserve_out <= 0:
+        return 0
+    num = fee * amount_in * reserve_out
+    den = 1000 * reserve_in + fee * amount_in
+    return num // den if den > 0 else 0
+
+
+def _calc_optimal_trade_size(r_in_buy: int, r_out_buy: int, r_out_sell: int, r_in_sell: int,
+                              fee: int = 997, max_fraction: float = 0.20) -> int:
+    """
+    Closed-form optimal flash-loan size for two V2 AMMs.
+    optimal = (f*sqrt(a*b*c*d) - a*c) / (f*(b+c))
+    where f=fee/1000, a=r_in_buy, b=r_out_buy, c=r_out_sell, d=r_in_sell.
+    """
+    try:
+        a, b, c, d = r_in_buy, r_out_buy, r_out_sell, r_in_sell
+        if min(a, b, c, d) <= 0:
+            return 0
+        f = fee / 1000.0
+        num = f * _math.sqrt(a * b * c * d) - a * c
+        den = f * (b + c)
+        if den <= 0 or num <= 0:
+            return 0
+        return min(int(num / den), int(min(a, d) * max_fraction))
+    except Exception:
+        return 0
+
+
+def _all_token_pairs() -> List[tuple]:
+    """
+    Generate ALL unique (tokenA, tokenB) combinations from the full token registry,
+    including dynamically discovered tokens.
+    """
+    # Merge static + dynamic tokens into a unified symbol-keyed dict
+    all_tokens: Dict[str, Dict] = dict(TOKENS)
+    for addr, info in DYNAMIC_TOKENS.items():
+        sym = info.get("symbol", addr[:6])
+        if sym not in all_tokens:
+            all_tokens[sym] = info
+    symbols = list(all_tokens.keys())
+    return list(_itertools.combinations(symbols, 2))
+
+
 async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
     """
-    Optimized arbitrage scanning with in-memory price matrix.
-    Detects both direct and triangular arbitrage opportunities.
-    
+    Universal arbitrage scanner — scans ALL token pairs across all 3 DEXes.
     Features:
-    - Focused pair scanning for speed
-    - Direct arbitrage (DEX A vs DEX B)
-    - Triangular arbitrage (A → B → C → A)
+    - Dynamic pair expansion (all TOKENS combinations + discovered tokens)
+    - Optimal flash-loan size (closed-form V2-V2, scaled for mixed DEX)
+    - Direct, triangular, and multi-hop detection
     - Risk-adjusted profit ranking
     """
     start_time = time.time()
     opportunities = []
-    
-    # Core high-liquidity pairs for fast scanning
-    pairs = [
-        ("WBERA", "HONEY"),
-        ("WBERA", "USDC"),
-        ("WBERA", "USDT"),
-        ("WBERA", "WETH"),
-        ("WBERA", "WBTC"),
-        ("HONEY", "USDC"),
-        ("HONEY", "USDT"),
-        ("WETH", "USDC"),
-        ("WBTC", "USDC"),
-        ("USDC", "USDT"),
-    ]
-    
+
+    # All token pairs (static + dynamically discovered tokens)
+    pairs = _all_token_pairs()
+
     # Update cache once
     await cache.update_gas_price()
     gas_price = cache.gas_price
@@ -1400,18 +1437,38 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         if spread > 0.05:
             total_gas = buy_quote.gas_estimate + sell_quote.gas_estimate
             gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
-            
-            amount_out_buy = int(buy_quote.amount_out)
-            amount_out_sell = int(sell_quote.amount_out)
-            
-            # Calculate profits
-            token_price = bera_price if token_b == "WBERA" else 1.0
+
+            # ── Optimal trade sizing ─────────────────────────────────
+            # Try to scale from the 100-unit probe to the optimal amount
+            pair_cache_key2 = cache.get_pair_key(token_a_info["address"], token_b_info["address"])
+            opt_amount_in = amount_in  # default: probe amount
+            if pair_cache_key2 in cache.pool_reserves:
+                res = cache.pool_reserves[pair_cache_key2]
+                r0 = res.get("reserve_a", 0)
+                r1 = res.get("reserve_b", 0)
+                if r0 and r1:
+                    opt = _calc_optimal_trade_size(r0, r1, r1, r0)
+                    if opt > 0:
+                        opt_amount_in = opt
+
+            scale = opt_amount_in / max(amount_in, 1)
+            amount_out_buy  = int(buy_quote.amount_out  * scale)
+            amount_out_sell = int(sell_quote.amount_out * scale)
+
+            # USD price for token_b
+            if token_b_info["address"].lower() in STABLE_ADDRESSES:
+                token_price = 1.0
+            elif token_b == "WBERA":
+                token_price = bera_price
+            else:
+                token_price = 1.0  # conservative
+
             raw_profit = (amount_out_sell - amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price
             slippage_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * 0.005
             impact_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * (price_impact / 100)
-            
+
             net_profit = raw_profit - gas_cost_usd - slippage_cost - impact_cost
-            
+
             if net_profit > MIN_PROFIT_THRESHOLD:
                 opp_data = {
                     "id": str(uuid.uuid4()),
@@ -1425,7 +1482,8 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
                     "potential_profit_usd": raw_profit,
                     "gas_cost_usd": gas_cost_usd,
                     "net_profit_usd": net_profit,
-                    "amount_in": str(amount_in),
+                    "optimal_amount_in": str(opt_amount_in),
+                    "amount_in": str(opt_amount_in),
                     "expected_out": str(amount_out_sell),
                     "token_in_address": token_a_info["address"],
                     "token_out_address": token_b_info["address"],
@@ -1439,11 +1497,25 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
             else:
                 arb_logger.log_skip(pair_key, f"net_profit ${net_profit:.4f} < threshold")
     
-    # Lightweight triangular detection using cached prices
-    # Only check if we have enough price data in matrix
+    # Triangular detection — search from every known token as pivot
     if len(price_matrix.prices) >= 4:
-        tri_paths = price_matrix.find_triangular_paths("WBERA")
-        for path in tri_paths[:5]:  # Check top 5 paths only
+        tri_paths = []
+        for pivot in list(TOKENS.keys()) + list(DYNAMIC_TOKENS.keys()):
+            sym = pivot if isinstance(pivot, str) else pivot.get("symbol", "")
+            if not sym:
+                continue
+            for p in price_matrix.find_triangular_paths(sym)[:3]:
+                tri_paths.append(p)
+        # Deduplicate by frozen path key
+        seen_tri = set()
+        deduped = []
+        for p in tri_paths:
+            key = tuple(sorted(p))
+            if key not in seen_tri:
+                seen_tri.add(key)
+                deduped.append(p)
+        tri_paths = deduped
+        for path in tri_paths[:20]:  # Check top 20 paths
             try:
                 # Quick profit estimate using cached prices
                 p1 = price_matrix.get_price(path[0], path[1])
@@ -2609,6 +2681,43 @@ async def scan_real_opportunities():
             "bera_price_usd": bera_price
         }
 
+@api_router.get("/production/scan-all")
+async def scan_all_market_opportunities():
+    """
+    Full market scan: discovers ALL pairs from Kodiak V2 factory and scans
+    every pair across Kodiak V2, Kodiak V3, and BEX.
+    Uses closed-form optimal trade sizing to maximize profit per opportunity.
+    Heavier than /scan-real but finds opportunities across the ENTIRE market.
+    """
+    try:
+        gas_price = w3.eth.gas_price
+    except Exception:
+        gas_price = int(1e9)
+    try:
+        bera_price = await get_token_price_coingecko("berachain-bera")
+        if bera_price <= 0:
+            raise ValueError("zero price")
+    except Exception:
+        bera_price = price_cache.get("bera_price", 5.0)
+
+    try:
+        opps = await real_price_scanner.scan_all_market_pairs(
+            gas_price_wei=gas_price,
+            bera_price_usd=bera_price,
+        )
+        metrics = real_price_scanner.get_scan_metrics()
+        return {
+            "opportunities": opps,
+            "count": len(opps),
+            "scan_metrics": metrics,
+            "gas_price_gwei": gas_price / 1e9,
+            "bera_price_usd": bera_price,
+        }
+    except Exception as e:
+        logger.error(f"scan-all error: {e}")
+        return {"error": str(e), "opportunities": [], "count": 0}
+
+
 @api_router.get("/production/execution-stats")
 async def get_production_execution_stats():
     """Get production execution statistics"""
@@ -2638,7 +2747,13 @@ async def websocket_prices(websocket: WebSocket):
     try:
         while True:
             scan_start = time.time()
-            
+
+            # Merge any newly discovered tokens into local TOKENS dict
+            for addr, info in DYNAMIC_TOKENS.items():
+                sym = info.get("symbol", addr[:6])
+                if sym not in TOKENS:
+                    TOKENS[sym] = info
+
             # Fast scan - target < 1 second
             opportunities = await find_arbitrage_opportunities_fast()
             

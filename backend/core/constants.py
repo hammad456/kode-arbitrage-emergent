@@ -26,15 +26,34 @@ HONEYPOT_ROUTER = "0x1306D3c36eC7E38dd2c128fBe3097C2C2449af64"
 WBERA = "0x6969696969696969696969696969696969696969"
 MULTICALL3_ADDRESS = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
-# Common tokens on Berachain
+# Common tokens on Berachain (anchor set — used as pivot/quote assets)
 TOKENS = {
     "WBERA": {"address": "0x6969696969696969696969696969696969696969", "decimals": 18, "symbol": "WBERA"},
     "HONEY": {"address": "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce", "decimals": 18, "symbol": "HONEY"},
-    "USDC": {"address": "0x549943e04f40284185054145c6E4e9568C1D3241", "decimals": 6, "symbol": "USDC"},
-    "USDT": {"address": "0x779Ded0c9e1022225f8E0630b35a9b54bE713736", "decimals": 6, "symbol": "USDT"},
-    "WETH": {"address": "0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590", "decimals": 18, "symbol": "WETH"},
-    "WBTC": {"address": "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c", "decimals": 8, "symbol": "WBTC"},
+    "USDC":  {"address": "0x549943e04f40284185054145c6E4e9568C1D3241", "decimals": 6,  "symbol": "USDC"},
+    "USDT":  {"address": "0x779Ded0c9e1022225f8E0630b35a9b54bE713736", "decimals": 6,  "symbol": "USDT"},
+    "WETH":  {"address": "0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590", "decimals": 18, "symbol": "WETH"},
+    "WBTC":  {"address": "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c", "decimals": 8,  "symbol": "WBTC"},
+    # Berachain ecosystem tokens
+    "iBGT":  {"address": "0x46eFC86F0D7455F135CC9df501673739d513E982", "decimals": 18, "symbol": "iBGT"},
+    "NECT":  {"address": "0xd137593CDB341CcC78426c54Fb98435C60Da193c", "decimals": 18, "symbol": "NECT"},
+    "LBGT":  {"address": "0x63b0EdC427664D4330F72eEc890A86b3F98ce225", "decimals": 18, "symbol": "LBGT"},
+    "STGUSDC": {"address": "0x6581e59A1C8dA66eD0D313a0d4029DcE2F746Cc5", "decimals": 6, "symbol": "STGUSDC"},
 }
+
+# Stablecoin addresses (used for USD liquidity estimation without price feed)
+STABLE_ADDRESSES = {
+    "0x549943e04f40284185054145c6E4e9568C1D3241",  # USDC
+    "0x779Ded0c9e1022225f8E0630b35a9b54bE713736",  # USDT
+    "0xd137593CDB341CcC78426c54Fb98435C60Da193c",  # NECT
+    "0x6581e59A1C8dA66eD0D313a0d4029DcE2F746Cc5",  # STGUSDC
+}
+
+# Reverse lookup: address → token info (populated from TOKENS)
+TOKEN_BY_ADDRESS: dict = {v["address"].lower(): {**v, "name": k} for k, v in TOKENS.items()}
+
+# Dynamic token registry — populated at runtime by factory discovery
+DYNAMIC_TOKENS: dict = {}
 
 # Safety Limits - Production Ready
 MAX_TRADE_SIZE_USD = 10000
