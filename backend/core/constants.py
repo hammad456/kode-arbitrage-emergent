@@ -60,3 +60,11 @@ GAS_INCREASE_PER_RETRY = 0.20  # 20% increase per retry
 
 # MAX_UINT256 for infinite approval
 MAX_UINT256 = 2**256 - 1
+
+# Flash Arbitrage Contract (set after deployment)
+FLASH_ARB_CONTRACT = os.environ.get('FLASH_ARB_CONTRACT', '')
+
+# BEX CrocSwap constants
+BEX_POOL_IDX = 36000
+BEX_MIN_SQRT_PRICE = 65536
+BEX_MAX_UINT128 = (2**128) - 1
