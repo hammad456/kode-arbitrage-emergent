@@ -59,13 +59,15 @@ DYNAMIC_TOKENS: dict = {}
 MAX_TRADE_SIZE_USD = 10000
 MAX_GAS_LIMIT = 500000
 TRADE_TIMEOUT_SECONDS = 120
-MIN_PROFIT_THRESHOLD = 0.0005  # $0.0005 minimum for micro-arb
-MIN_SPREAD_THRESHOLD = 0.05   # 0.05% spread threshold
-MAX_SLIPPAGE_PERCENT = 5.0
+# Minimum profit floors (raised from $0.0005 to provide real safety margin)
+MIN_PROFIT_THRESHOLD = 0.01    # $0.01 scanner filter (show only real opportunities)
+MIN_NET_PROFIT_USD   = 0.01    # $0.01 executor hard floor (never execute below this)
+MIN_SPREAD_THRESHOLD = 0.10    # 0.10% spread — covers 2×0.3% DEX fee + buffer
+MAX_SLIPPAGE_PERCENT = 3.0     # tighter than before (was 5.0)
 PRICE_CHANGE_TOLERANCE = 2.0
 GAS_BUFFER_MULTIPLIER = 1.3
-MAX_PRICE_IMPACT_PERCENT = 3.0
-MIN_LIQUIDITY_USD = 200
+MAX_PRICE_IMPACT_PERCENT = 2.0  # tighter (was 3.0)
+MIN_LIQUIDITY_USD = 500         # raised from $200 — low-liq pairs are dangerous
 DEX_FEE_PERCENT = 0.3  # Default 0.3% DEX fee
 
 # Multi-hop config

@@ -53,16 +53,48 @@ except Exception as _mongo_err:
         client = AsyncIOMotorClient(mongo_url)
         db = client[db_name]
 
-# Berachain Configuration
-BERACHAIN_RPC = os.environ.get('BERACHAIN_RPC', 'https://rpc.berachain.com')
+# ─── Berachain RPC — multi-endpoint with local node priority ────────────────
+# Priority: LOCAL_NODE_RPC → BERACHAIN_RPC → public fallbacks
+_LOCAL_NODE_RPC = os.environ.get('LOCAL_NODE_RPC', '')        # e.g. http://localhost:8545
+_PUBLIC_RPC     = os.environ.get('BERACHAIN_RPC', 'https://rpc.berachain.com')
+# Comma-separated fallback RPCs (tried in order if primary fails)
+_FALLBACK_RPCS  = [r.strip() for r in os.environ.get('FALLBACK_RPCS', '').split(',') if r.strip()]
+BERACHAIN_RPC   = _LOCAL_NODE_RPC if _LOCAL_NODE_RPC else _PUBLIC_RPC
 CHAIN_ID = 80094
 
-# Initialize Web3
-w3 = Web3(Web3.HTTPProvider(BERACHAIN_RPC))
 
-# Initialize Private RPC for MEV Protection (if configured)
+def _make_w3(rpc_url: str) -> Web3:
+    """Create a Web3 instance and verify connectivity."""
+    w3_candidate = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+    try:
+        if w3_candidate.is_connected():
+            logger.info(f"RPC connected: {rpc_url}")
+            return w3_candidate
+    except Exception:
+        pass
+    logger.warning(f"RPC NOT connected: {rpc_url}")
+    return w3_candidate
+
+
+def _best_w3() -> Web3:
+    """Try RPCs in priority order; return first that connects."""
+    candidates = [BERACHAIN_RPC] + _FALLBACK_RPCS
+    for url in candidates:
+        if not url:
+            continue
+        candidate = _make_w3(url)
+        if candidate.is_connected():
+            return candidate
+    # Return primary even if offline (will fail at call time with clear error)
+    return _make_w3(BERACHAIN_RPC)
+
+
+# Initialize Web3 with best available RPC
+w3 = _best_w3()
+
+# Private RPC for MEV protection (Flashbots-style private submission)
 private_rpc_url = os.environ.get('PRIVATE_RPC_URL', '')
-private_w3 = Web3(Web3.HTTPProvider(private_rpc_url)) if private_rpc_url else None
+private_w3 = _make_w3(private_rpc_url) if private_rpc_url else None
 
 # Initialize Production Execution Components
 token_approval_manager = TokenApprovalManager(w3)
@@ -72,16 +104,23 @@ real_price_scanner = RealPriceScanner(w3)
 trade_logger = TradeLogger()
 
 # Production Mode Flag
-PRODUCTION_MODE = os.environ.get('PRODUCTION_MODE', 'false').lower() == 'true'
-USE_PRIVATE_RPC = os.environ.get('USE_PRIVATE_RPC', 'true').lower() == 'true'
+PRODUCTION_MODE  = os.environ.get('PRODUCTION_MODE', 'false').lower() == 'true'
+USE_PRIVATE_RPC  = os.environ.get('USE_PRIVATE_RPC', 'false').lower() == 'true'
+USING_LOCAL_NODE = bool(_LOCAL_NODE_RPC and w3.provider.endpoint_uri == _LOCAL_NODE_RPC)  # type: ignore
 
-# Safety limits - Production ready (Micro-Arbitrage Optimized)
-MAX_TRADE_SIZE_USD = 10000
-MAX_GAS_LIMIT = 500000
+logger.info(
+    f"RPC mode: {'LOCAL NODE' if USING_LOCAL_NODE else 'PUBLIC RPC'} → {BERACHAIN_RPC} | "
+    f"MEV protection: {'ON' if USE_PRIVATE_RPC and private_rpc_url else 'OFF'}"
+)
+
+# ─── Safety limits (imported from core.constants — single source of truth) ──
+from core.constants import (
+    MIN_PROFIT_THRESHOLD, MIN_SPREAD_THRESHOLD, MAX_SLIPPAGE_PERCENT,
+    MAX_PRICE_IMPACT_PERCENT, MIN_LIQUIDITY_USD
+)
+MAX_TRADE_SIZE_USD    = 10000
+MAX_GAS_LIMIT         = 500000
 TRADE_TIMEOUT_SECONDS = 120
-MIN_PROFIT_THRESHOLD = 0.0005  # $0.0005 minimum for micro-arb
-MIN_SPREAD_THRESHOLD = 0.05   # 0.05% spread threshold (micro-arbitrage)
-MAX_SLIPPAGE_PERCENT = 5.0
 PRICE_CHANGE_TOLERANCE = 2.0
 GAS_BUFFER_MULTIPLIER = 1.3
 MAX_PRICE_IMPACT_PERCENT = 3.0
@@ -2438,18 +2477,35 @@ async def execute_atomic_arbitrage(request: AtomicExecutionRequest):
                 "opportunities_available": len(opportunities)
             }
         
-        # Get current BERA price
-        bera_price = await get_token_price_coingecko("berachain-bera")
-        
-        # Check and approve tokens if needed
-        tokens = opportunity["token_pair"].split("/")
-        token_in = TOKENS.get(tokens[0])
-        
+        # ── Get fresh prices at execution time ──────────────────────
+        try:
+            bera_price = await get_token_price_coingecko("berachain-bera")
+            if bera_price <= 0:
+                raise ValueError("zero price")
+        except Exception:
+            bera_price = price_cache.get("bera_price", 5.0)
+
+        # ── Staleness check: reject if opportunity is too old ────────
+        opp_ts = opportunity.get("timestamp")
+        MAX_OPP_AGE_SECONDS = 15  # opportunity must be < 15 seconds old
+        if opp_ts:
+            age = time.time() - float(opp_ts)
+            if age > MAX_OPP_AGE_SECONDS:
+                return {
+                    "success": False,
+                    "error": f"Opportunity is {age:.0f}s old (max {MAX_OPP_AGE_SECONDS}s). Re-scan first.",
+                }
+
+        # ── Check and approve tokens ─────────────────────────────────
+        pair_str = opportunity["token_pair"]
+        tokens_split = pair_str.split("/") if "/" in pair_str else pair_str.split(" → ")[:2]
+        token_in_sym = tokens_split[0] if tokens_split else ""
+        token_in = TOKENS.get(token_in_sym) or DYNAMIC_TOKENS.get(token_in_sym)
+
         if token_in:
-            # Determine which router needs approval
-            buy_dex = opportunity.get("buy_dex", "Kodiak V2")
+            buy_dex    = opportunity.get("buy_dex", "Kodiak V2")
             buy_router = KODIAK_V2_ROUTER if "Kodiak" in buy_dex else BEX_ROUTER
-            
+
             approval_result = await token_approval_manager.ensure_approval(
                 token_address=token_in["address"],
                 spender=buy_router,
@@ -2457,14 +2513,14 @@ async def execute_atomic_arbitrage(request: AtomicExecutionRequest):
                 required_amount=int(opportunity["amount_in"]),
                 private_key=request.private_key
             )
-            
+
             if not approval_result["success"]:
                 return {
                     "success": False,
                     "error": f"Token approval failed: {approval_result.get('error')}",
                     "approval_result": approval_result
                 }
-        
+
         # Execute atomic arbitrage
         result = await atomic_executor.execute_arbitrage(
             opportunity=opportunity,
