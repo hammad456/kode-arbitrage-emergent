@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT_DIR))
 # Import production modules
 from core.constants import (
     PRIVATE_RPC_URL, DEX_FEE_PERCENT, MAX_RETRY_ATTEMPTS,
-    RETRY_BASE_DELAY, GAS_INCREASE_PER_RETRY, MAX_UINT256
+    RETRY_BASE_DELAY, GAS_INCREASE_PER_RETRY, MAX_UINT256, MEV_COST_FRACTION
 )
 from execution.token_approval import TokenApprovalManager
 from execution.atomic_executor import AtomicArbExecutor, TradeLogger
@@ -441,7 +441,7 @@ class TradingCache:
     """High-performance in-memory cache for maximum speed"""
     def __init__(self):
         self.pool_reserves: Dict[str, Dict] = {}
-        self.token_prices: Dict[str, float] = {"bera": 5.0}
+        self.token_prices: Dict[str, float] = {"bera": 0.0}  # 0 = not yet fetched
         self.gas_price: int = 50 * 10**9
         self.pair_addresses: Dict[str, str] = {}
         self.token_metadata: Dict[str, Dict] = {}
@@ -450,7 +450,7 @@ class TradingCache:
         self.quotes_cache: Dict[str, Dict] = {}  # Cache recent quotes
         self.lock = asyncio.Lock()
     
-    def is_stale(self, key: str, max_age: float = 5.0) -> bool:
+    def is_stale(self, key: str, max_age: float = 2.0) -> bool:
         return time.time() - self.last_update.get(key, 0) > max_age
     
     async def update_gas_price(self):
@@ -507,36 +507,210 @@ auto_engine = AutoExecutionEngine()
 
 # Cache for prices
 price_cache = {
-    "bera_price": 5.0,
-    "last_update": 0
+    "bera_price": 0.0,   # 0 = not yet fetched; never default to arbitrary value
+    "last_update": 0,
+    "source": "none"
 }
 
+async def _get_token_price_onchain(symbol: str) -> float:
+    """
+    Derive USD price for a token by reading its USDC or WBERA pair reserves from Kodiak V2.
+    Supports: WETH, WBTC, iBGT, LBGT, NECT and any token with a USDC or WBERA pair.
+    Returns 0.0 if price cannot be determined.
+    """
+    token_info = TOKENS.get(symbol)
+    if not token_info:
+        return 0.0
+
+    # Try pairing with USDC first (direct USD), then WBERA (indirect via BERA price)
+    stables = ["USDC", "USDT"]
+    bera_price = cache.token_prices.get("bera", 0.0)
+
+    try:
+        factory_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(KODIAK_V2_FACTORY), abi=FACTORY_ABI
+        )
+        for quote_sym in stables:
+            quote_info = TOKENS.get(quote_sym)
+            if not quote_info:
+                continue
+            pair_addr = factory_contract.functions.getPair(
+                Web3.to_checksum_address(token_info["address"]),
+                Web3.to_checksum_address(quote_info["address"])
+            ).call()
+            if pair_addr == "0x0000000000000000000000000000000000000000":
+                continue
+
+            pair_contract = w3.eth.contract(
+                address=Web3.to_checksum_address(pair_addr), abi=PAIR_ABI
+            )
+            reserves = pair_contract.functions.getReserves().call()
+            token0   = pair_contract.functions.token0().call()
+
+            if token0.lower() == token_info["address"].lower():
+                r_token = reserves[0] / (10 ** token_info["decimals"])
+                r_stable = reserves[1] / (10 ** quote_info["decimals"])
+            else:
+                r_stable = reserves[0] / (10 ** quote_info["decimals"])
+                r_token  = reserves[1] / (10 ** token_info["decimals"])
+
+            if r_token <= 0:
+                continue
+            price = r_stable / r_token
+            if price > 0:
+                logger.info(f"[PriceFeed] {symbol}/{quote_sym} on-chain: ${price:.4f}")
+                return price
+
+        # Fallback: try WBERA pair if we have BERA price
+        if bera_price > 0:
+            wbera_info = TOKENS.get("WBERA")
+            if wbera_info:
+                pair_addr = factory_contract.functions.getPair(
+                    Web3.to_checksum_address(token_info["address"]),
+                    Web3.to_checksum_address(wbera_info["address"])
+                ).call()
+                if pair_addr != "0x0000000000000000000000000000000000000000":
+                    pair_contract = w3.eth.contract(
+                        address=Web3.to_checksum_address(pair_addr), abi=PAIR_ABI
+                    )
+                    reserves = pair_contract.functions.getReserves().call()
+                    token0   = pair_contract.functions.token0().call()
+
+                    if token0.lower() == token_info["address"].lower():
+                        r_token = reserves[0] / (10 ** token_info["decimals"])
+                        r_bera  = reserves[1] / 1e18
+                    else:
+                        r_bera  = reserves[0] / 1e18
+                        r_token = reserves[1] / (10 ** token_info["decimals"])
+
+                    if r_token > 0:
+                        price = (r_bera / r_token) * bera_price
+                        if price > 0:
+                            logger.info(f"[PriceFeed] {symbol}/WBERA on-chain: ${price:.4f}")
+                            return price
+    except Exception as e:
+        logger.debug(f"On-chain price for {symbol} failed: {e}")
+    return 0.0
+
+
+async def _refresh_all_token_prices():
+    """
+    Refresh prices for all non-stable tokens using on-chain data.
+    Called periodically from the background price update task.
+    """
+    bera = await get_token_price_coingecko("berachain-bera")
+    if bera > 0:
+        await cache.update_token_price("bera", bera)
+
+    # Tokens that need on-chain price (not stables, not WBERA itself)
+    price_tokens = ["WETH", "WBTC", "iBGT", "LBGT", "NECT"]
+    for sym in price_tokens:
+        price = await _get_token_price_onchain(sym)
+        if price > 0:
+            await cache.update_token_price(sym.lower(), price)
+
+
+async def _get_bera_price_onchain() -> float:
+    """
+    Get BERA price from on-chain WBERA/USDC Kodiak V2 reserves.
+    Formula: price = reserve_usdc / reserve_wbera (adjusted for decimals).
+    Returns 0.0 if it cannot be determined.
+    """
+    try:
+        wbera = TOKENS.get("WBERA", {}).get("address", "")
+        usdc  = TOKENS.get("USDC",  {}).get("address", "")
+        if not wbera or not usdc:
+            return 0.0
+
+        factory_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(KODIAK_V2_FACTORY), abi=FACTORY_ABI
+        )
+        pair_addr = factory_contract.functions.getPair(
+            Web3.to_checksum_address(wbera),
+            Web3.to_checksum_address(usdc)
+        ).call()
+
+        if pair_addr == "0x0000000000000000000000000000000000000000":
+            return 0.0
+
+        pair_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(pair_addr), abi=PAIR_ABI
+        )
+        reserves = pair_contract.functions.getReserves().call()
+        token0   = pair_contract.functions.token0().call()
+
+        if token0.lower() == wbera.lower():
+            r_wbera = reserves[0] / 1e18
+            r_usdc  = reserves[1] / 1e6
+        else:
+            r_usdc  = reserves[0] / 1e6
+            r_wbera = reserves[1] / 1e18
+
+        if r_wbera <= 0:
+            return 0.0
+
+        price = r_usdc / r_wbera
+        # Sanity check: BERA should be between $0.10 and $500
+        if 0.1 <= price <= 500:
+            logger.info(f"[PriceFeed] BERA on-chain price: ${price:.4f}")
+            return price
+    except Exception as e:
+        logger.debug(f"On-chain BERA price failed: {e}")
+    return 0.0
+
+
 async def get_token_price_coingecko(token_id: str) -> float:
-    """Fetch token price from CoinGecko API with caching"""
+    """
+    Fetch BERA price using priority chain:
+      1. CoinGecko API
+      2. On-chain WBERA/USDC reserves (Kodiak V2)
+      3. Last known cached price
+    Never falls back to an arbitrary hardcoded constant.
+    """
     global price_cache
     current_time = time.time()
-    
-    if current_time - price_cache["last_update"] < 60:  # Cache for 60 seconds
+
+    # Return cached if fresh (60 s)
+    if current_time - price_cache["last_update"] < 60 and price_cache["bera_price"] > 0:
         if token_id == "berachain-bera":
             return price_cache["bera_price"]
-    
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids": token_id, "vs_currencies": "usd"}
-            )
-            if response.status_code == 200:
-                data = response.json()
-                price = data.get(token_id, {}).get("usd", 0)
-                if token_id == "berachain-bera" and price > 0:
-                    price_cache["bera_price"] = price
-                    price_cache["last_update"] = current_time
-                return price
-    except Exception as e:
-        logger.error(f"CoinGecko price fetch error: {e}")
-    
-    return price_cache.get("bera_price", 5.0) if token_id == "berachain-bera" else 0
+
+    if token_id == "berachain-bera":
+        # 1. Try CoinGecko
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    "https://api.coingecko.com/api/v3/simple/price",
+                    params={"ids": token_id, "vs_currencies": "usd"}
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    price = data.get(token_id, {}).get("usd", 0)
+                    if price > 0:
+                        price_cache["bera_price"] = price
+                        price_cache["last_update"] = current_time
+                        price_cache["source"] = "coingecko"
+                        return price
+        except Exception as e:
+            logger.warning(f"CoinGecko price fetch failed: {e}")
+
+        # 2. Fallback: on-chain price
+        on_chain_price = await _get_bera_price_onchain()
+        if on_chain_price > 0:
+            price_cache["bera_price"] = on_chain_price
+            price_cache["last_update"] = current_time
+            price_cache["source"] = "on-chain"
+            return on_chain_price
+
+        # 3. Last known cached price (do NOT use a hardcoded constant)
+        if price_cache["bera_price"] > 0:
+            logger.warning(f"[PriceFeed] Using stale BERA price: ${price_cache['bera_price']:.4f}")
+            return price_cache["bera_price"]
+
+        logger.error("[PriceFeed] BERA price unavailable — all sources failed")
+        return 0.0
+
+    return 0.0
 
 # ============== MULTICALL BATCH QUERIES ==============
 async def multicall_batch_quotes(calls_data: List[Dict]) -> List[Optional[int]]:
@@ -935,10 +1109,19 @@ async def verify_profit_onchain(opp: Dict) -> Dict:
         
         # Get current gas cost
         gas_price = cache.gas_price
-        bera_price = cache.token_prices.get("bera", 5.0)
+        bera_price = cache.token_prices.get("bera", 0.0)
+        if bera_price <= 0:
+            return {"valid": False, "reason": "BERA price unavailable"}
         gas_cost_usd = (300000 * gas_price / 10**18) * bera_price
-        
-        token_price = bera_price if tokens[0] == "WBERA" else 1.0
+
+        if tokens[0] == "WBERA":
+            token_price = bera_price
+        elif TOKENS.get(tokens[0], {}).get("address", "").lower() in STABLE_ADDRESSES:
+            token_price = 1.0
+        else:
+            token_price = cache.token_prices.get(tokens[0].lower(), 0.0)
+        if token_price <= 0:
+            return {"valid": False, "reason": f"Price unavailable for {tokens[0]}"}
         net_profit_usd = (raw_profit_decimal * token_price) - gas_cost_usd
         
         # Safety: reject if final profit <= 0
@@ -971,7 +1154,7 @@ async def find_triangular_arbitrage(base_token: str = "WBERA", amount_in: int = 
         amount_in = int(100 * (10 ** base_info["decimals"]))
     
     gas_price = cache.gas_price
-    bera_price = cache.token_prices.get("bera", 5.0)
+    bera_price = cache.token_prices.get("bera", 0.0)
     
     # Get all triangular paths from price matrix
     paths = price_matrix.find_triangular_paths(base_token)
@@ -1031,9 +1214,10 @@ async def find_triangular_arbitrage(base_token: str = "WBERA", amount_in: int = 
             # Calculate costs
             gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
             slippage_cost_usd = (amount_in / (10 ** base_info["decimals"])) * token_price * 0.015  # 1.5% for 3 swaps
-            
-            net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd
-            
+            mev_cost_usd = raw_profit_usd * MEV_COST_FRACTION  # 15% sandwich risk buffer
+
+            net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd - mev_cost_usd
+
             if net_profit_usd > MIN_PROFIT_THRESHOLD:
                 profit_percent = (raw_profit / amount_in) * 100 if amount_in > 0 else 0
                 
@@ -1072,7 +1256,7 @@ async def find_multi_hop_arbitrage(base_token: str = "WBERA", amount_in: int = N
         amount_in = int(50 * (10 ** base_info["decimals"]))  # Smaller amount for multi-hop
     
     gas_price = cache.gas_price
-    bera_price = cache.token_prices.get("bera", 5.0)
+    bera_price = cache.token_prices.get("bera", 0.0)
     
     # Get multi-hop paths from price matrix (limit to avoid performance issues)
     paths = price_matrix.find_multi_hop_paths(base_token, max_hops)[:20]
@@ -1144,9 +1328,10 @@ async def find_multi_hop_arbitrage(base_token: str = "WBERA", amount_in: int = N
             gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
             slippage_per_hop = 0.005  # 0.5% per hop
             slippage_cost_usd = (amount_in / (10 ** base_info["decimals"])) * token_price * slippage_per_hop * (len(path) - 1)
-            
-            net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd
-            
+            mev_cost_usd = raw_profit_usd * MEV_COST_FRACTION  # 15% sandwich risk buffer
+
+            net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd - mev_cost_usd
+
             if net_profit_usd > MIN_PROFIT_THRESHOLD:
                 profit_percent = (raw_profit / amount_in) * 100 if amount_in > 0 else 0
                 
@@ -1354,12 +1539,16 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
     # All token pairs (static + dynamically discovered tokens)
     pairs = _all_token_pairs()
 
-    # Update cache once
+    # Update cache once (prices + gas)
     await cache.update_gas_price()
     gas_price = cache.gas_price
-    
-    bera_price = await get_token_price_coingecko("berachain-bera")
-    await cache.update_token_price("bera", bera_price)
+
+    # Refresh all token prices (BERA + WETH/WBTC/iBGT etc.)
+    await _refresh_all_token_prices()
+    bera_price = cache.token_prices.get("bera", 0.0)
+    if bera_price <= 0:
+        logger.error("[Scanner] BERA price unavailable — skipping scan to avoid miscalculation")
+        return []
     
     # Build all quote tasks at once
     quote_tasks = []
@@ -1404,30 +1593,47 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         # Update price matrix for triangular detection
         await price_matrix.update(token_a, token_b, quote.price, int(quote.amount_out))
         
-        # Estimate liquidity and price impact (use cached or defaults)
-        liquidity_usd = 10000  # Default
-        price_impact = quote.price_impact
-        
-        # Check cache for reserves
+        # Fetch real reserves for this pair to get actual liquidity + price impact
         pair_cache_key = cache.get_pair_key(token_a_info["address"], token_b_info["address"])
-        if pair_cache_key in cache.pool_reserves:
-            reserves = cache.pool_reserves[pair_cache_key]
-            reserve_a = reserves["reserve_a"] / (10 ** token_a_info["decimals"])
-            reserve_b = reserves["reserve_b"] / (10 ** token_b_info["decimals"])
-            
-            if token_a == "WBERA":
-                liquidity_usd = reserve_a * bera_price * 2
-            elif token_b == "WBERA":
-                liquidity_usd = reserve_b * bera_price * 2
-            else:
-                liquidity_usd = max(reserve_a, reserve_b) * 2
-            
-            # Skip low liquidity
-            if liquidity_usd < MIN_LIQUIDITY_USD:
-                continue
-        
+        if pair_cache_key not in cache.pool_reserves:
+            # Fetch reserves on-demand (async)
+            _reserves = await get_pool_reserves(token_a_info["address"], token_b_info["address"])
+            if _reserves:
+                cache.pool_reserves[pair_cache_key] = _reserves
+
+        if pair_cache_key not in cache.pool_reserves:
+            # No liquidity data available — skip this pair
+            arb_logger.log_skip(pair_key, "No reserves data")
+            continue
+
+        reserves = cache.pool_reserves[pair_cache_key]
+        reserve_a_raw = reserves["reserve_a"]
+        reserve_b_raw = reserves["reserve_b"]
+        reserve_a = reserve_a_raw / (10 ** token_a_info["decimals"])
+        reserve_b = reserve_b_raw / (10 ** token_b_info["decimals"])
+
+        if token_a == "WBERA":
+            liquidity_usd = reserve_a * bera_price * 2
+        elif token_b == "WBERA":
+            liquidity_usd = reserve_b * bera_price * 2
+        elif token_a_info["address"].lower() in STABLE_ADDRESSES:
+            liquidity_usd = reserve_a * 2
+        elif token_b_info["address"].lower() in STABLE_ADDRESSES:
+            liquidity_usd = reserve_b * 2
+        else:
+            liquidity_usd = max(reserve_a, reserve_b) * 2  # conservative estimate
+
+        # Skip low liquidity
+        if liquidity_usd < MIN_LIQUIDITY_USD:
+            arb_logger.log_skip(pair_key, f"Low liquidity ${liquidity_usd:.0f}")
+            continue
+
+        # Real price impact from reserves (constant-product formula)
+        price_impact = calculate_price_impact(amount_in, reserve_a_raw, reserve_b_raw)
+
         # Skip high price impact
         if price_impact > MAX_PRICE_IMPACT_PERCENT:
+            arb_logger.log_skip(pair_key, f"Price impact {price_impact:.2f}% > max")
             continue
         
         # Get quotes from both Kodiak V3 and BEX in parallel
@@ -1473,40 +1679,77 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         
         spread = ((sell_quote.price - buy_quote.price) / buy_quote.price) * 100
         
-        if spread > 0.05:
-            total_gas = buy_quote.gas_estimate + sell_quote.gas_estimate
-            gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
-
+        if spread > MIN_SPREAD_THRESHOLD:
             # ── Optimal trade sizing ─────────────────────────────────
-            # Try to scale from the 100-unit probe to the optimal amount
-            pair_cache_key2 = cache.get_pair_key(token_a_info["address"], token_b_info["address"])
             opt_amount_in = amount_in  # default: probe amount
-            if pair_cache_key2 in cache.pool_reserves:
-                res = cache.pool_reserves[pair_cache_key2]
-                r0 = res.get("reserve_a", 0)
-                r1 = res.get("reserve_b", 0)
+            if buy_quote.dex == "Kodiak V2" and sell_quote.dex == "Kodiak V2":
+                r0 = reserve_a_raw
+                r1 = reserve_b_raw
                 if r0 and r1:
                     opt = _calc_optimal_trade_size(r0, r1, r1, r0)
                     if opt > 0:
                         opt_amount_in = opt
 
-            scale = opt_amount_in / max(amount_in, 1)
-            amount_out_buy  = int(buy_quote.amount_out  * scale)
-            amount_out_sell = int(sell_quote.amount_out * scale)
+            # ── Round-trip simulation with optimal size ───────────────
+            # Step 1: buy token_b at buy_dex with opt_amount_in token_a
+            if buy_quote.dex == "BEX":
+                buy_out_actual = await real_price_scanner.get_bex_quote(
+                    token_a_info["address"], token_b_info["address"], opt_amount_in
+                )
+            else:
+                buy_out_actual = await simulate_swap_onchain(
+                    KODIAK_V2_ROUTER if buy_quote.dex == "Kodiak V2" else KODIAK_V3_ROUTER,
+                    opt_amount_in,
+                    [token_a_info["address"], token_b_info["address"]]
+                )
 
-            # USD price for token_b
-            if token_b_info["address"].lower() in STABLE_ADDRESSES:
+            if not buy_out_actual or buy_out_actual <= 0:
+                arb_logger.log_skip(pair_key, "Buy simulation failed for optimal size")
+                continue
+
+            # Step 2: sell buy_out_actual token_b back to token_a at sell_dex
+            if sell_quote.dex == "BEX":
+                sell_back_actual = await real_price_scanner.get_bex_quote(
+                    token_b_info["address"], token_a_info["address"], buy_out_actual
+                )
+            else:
+                sell_back_actual = await simulate_swap_onchain(
+                    KODIAK_V2_ROUTER if sell_quote.dex == "Kodiak V2" else KODIAK_V3_ROUTER,
+                    buy_out_actual,
+                    [token_b_info["address"], token_a_info["address"]]
+                )
+
+            if not sell_back_actual or sell_back_actual <= 0:
+                arb_logger.log_skip(pair_key, "Sell simulation failed for optimal size")
+                continue
+
+            # Gross profit in token_a units
+            raw_profit_raw = sell_back_actual - opt_amount_in
+            if raw_profit_raw <= 0:
+                arb_logger.log_skip(pair_key, "Round-trip shows no gross profit")
+                continue
+
+            # USD price for token_a (input token)
+            if token_a_info["address"].lower() in STABLE_ADDRESSES:
                 token_price = 1.0
-            elif token_b == "WBERA":
+            elif token_a == "WBERA":
                 token_price = bera_price
             else:
-                token_price = 1.0  # conservative
+                token_price = cache.token_prices.get(token_a.lower(), 1.0)
 
-            raw_profit = (amount_out_sell - amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price
-            slippage_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * 0.005
-            impact_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * (price_impact / 100)
+            raw_profit = (raw_profit_raw / (10 ** token_a_info["decimals"])) * token_price
 
-            net_profit = raw_profit - gas_cost_usd - slippage_cost - impact_cost
+            total_gas = 250000 * 2  # buy + sell
+            gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
+
+            # DEX fees: 0.3% on each swap (input amounts)
+            amount_in_usd = (opt_amount_in / (10 ** token_a_info["decimals"])) * token_price
+            dex_fees_usd = amount_in_usd * (DEX_FEE_PERCENT / 100) * 2
+
+            # Slippage: 0.5% of input (NOT double-counted with price impact)
+            slippage_cost = amount_in_usd * 0.005
+
+            net_profit = raw_profit - gas_cost_usd - dex_fees_usd - slippage_cost
 
             if net_profit > MIN_PROFIT_THRESHOLD:
                 opp_data = {
@@ -1520,16 +1763,17 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
                     "spread_percent": spread,
                     "potential_profit_usd": raw_profit,
                     "gas_cost_usd": gas_cost_usd,
+                    "dex_fees_usd": dex_fees_usd,
+                    "slippage_cost_usd": slippage_cost,
                     "net_profit_usd": net_profit,
                     "optimal_amount_in": str(opt_amount_in),
                     "amount_in": str(opt_amount_in),
-                    "expected_out": str(amount_out_sell),
+                    "expected_out": str(sell_back_actual),  # token_a returned
                     "token_in_address": token_a_info["address"],
-                    "token_out_address": token_b_info["address"],
+                    "token_out_address": token_a_info["address"],  # round-trip
+                    "intermediate_token": token_b_info["address"],
                     "liquidity_usd": liquidity_usd,
                     "price_impact": price_impact,
-                    "slippage_cost_usd": slippage_cost,
-                    "price_impact_cost_usd": impact_cost
                 }
                 opportunities.append(opp_data)
                 arb_logger.log_opportunity(opp_data)
@@ -1588,10 +1832,9 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
                                 "expected_out": str(int(100 * cycle_return * 10**18)),
                                 "token_in_address": TOKENS.get("WBERA", {}).get("address", ""),
                                 "token_out_address": TOKENS.get("WBERA", {}).get("address", ""),
-                                "liquidity_usd": 5000,
+                                "liquidity_usd": 0,  # unknown without simulation
                                 "price_impact": 2.0,
-                                "slippage_cost_usd": 0.015 * net_estimate,
-                                "price_impact_cost_usd": 0.02 * net_estimate,
+                                "slippage_cost_usd": 0.015 * abs(net_estimate),
                                 "path": path
                             })
             except Exception:
@@ -1687,8 +1930,9 @@ async def verify_opportunity_onchain(pair: str, buy_dex: str, sell_dex: str, amo
     slippage_factor = slippage / 100
     slippage_cost_usd = abs(buy_amount_out) / (10 ** token_out["decimals"]) * token_price * slippage_factor
     
-    # Net profit = raw_profit - gas_cost - slippage_cost
-    net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd
+    # Net profit = raw_profit - gas_cost - slippage_cost - MEV risk buffer
+    mev_cost_usd = raw_profit_usd * MEV_COST_FRACTION
+    net_profit_usd = raw_profit_usd - gas_cost_usd - slippage_cost_usd - mev_cost_usd
     
     # Safety validations
     safety_checks = {

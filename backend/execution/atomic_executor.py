@@ -22,10 +22,14 @@ from web3.exceptions import ContractLogicError, TransactionNotFound
 
 from core.constants import (
     MAX_RETRY_ATTEMPTS, RETRY_BASE_DELAY, GAS_INCREASE_PER_RETRY,
-    GAS_BUFFER_MULTIPLIER, MAX_GAS_LIMIT, DEX_FEE_PERCENT,
-    TRADE_TIMEOUT_SECONDS, PRIVATE_RPC_URL, KODIAK_V2_ROUTER, BEX_ROUTER
+    GAS_BUFFER_MULTIPLIER, MAX_GAS_LIMIT, DEX_FEE_PERCENT, MEV_COST_FRACTION,
+    TRADE_TIMEOUT_SECONDS, PRIVATE_RPC_URL, KODIAK_V2_ROUTER, KODIAK_V3_ROUTER,
+    KODIAK_V3_FEE_TIERS, BEX_ROUTER
 )
-from core.abis import ROUTER_V2_ABI, ERC20_ABI, BEX_QUERY_ABI, BEX_ROUTER_ABI
+from core.abis import (
+    ROUTER_V2_ABI, ERC20_ABI, BEX_QUERY_ABI, BEX_ROUTER_ABI,
+    KODIAK_V3_ROUTER_ABI
+)
 from core.constants import BEX_QUERY, BEX_POOL_IDX, BEX_MIN_SQRT_PRICE, BEX_MAX_UINT128
 
 logger = logging.getLogger(__name__)
@@ -33,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Conservative, consistent gas estimate for one V2 swap
 GAS_PER_SWAP = 250_000
 # Minimum net profit to even attempt execution (prevents dust trades)
-MIN_NET_PROFIT_USD = 0.01   # $0.01 hard floor
+MIN_NET_PROFIT_USD = 0.50   # $0.50 hard floor — must exceed all costs including MEV
 
 
 class TradeLogger:
@@ -100,11 +104,38 @@ class TradeLogger:
             logger.error(f"Failed to read trades: {e}")
             return []
 
+    def get_pair_success_rate(self, pair: str, min_samples: int = 5) -> Optional[float]:
+        """
+        Return success rate (0.0-1.0) for a given pair over last 50 trades.
+        Returns None if fewer than min_samples trades recorded for this pair.
+        """
+        trades = self.get_recent_trades(limit=500)
+        pair_trades = [t for t in trades if t.get("pair") == pair]
+        if len(pair_trades) < min_samples:
+            return None  # Not enough data — don't skip
+        recent = pair_trades[-50:]
+        successes = sum(1 for t in recent if t.get("status") == "success")
+        return successes / len(recent)
+
+    def should_skip_pair(self, pair: str, min_success_rate: float = 0.3) -> bool:
+        """
+        Returns True if this pair has a historically poor success rate (<30%).
+        Skip threshold is intentionally low to avoid false positives on new pairs.
+        """
+        rate = self.get_pair_success_rate(pair)
+        if rate is None:
+            return False  # No data = don't skip
+        skip = rate < min_success_rate
+        if skip:
+            logger.info(f"[SKIP] Pair {pair} success rate {rate:.1%} < {min_success_rate:.1%} threshold")
+        return skip
+
 
 class AtomicArbExecutor:
     """
     Production-grade arbitrage executor with:
     - Strict pre-execution profit simulation (eth_call, no gas)
+    - Token approval ensured before every swap
     - Post-buy actual balance verification — ABORTS sell if can't confirm
     - Accurate net_profit including all costs (gas + fees + slippage)
     - Retry logic with exponential backoff + gas escalation
@@ -115,6 +146,8 @@ class AtomicArbExecutor:
         self.w3 = w3
         self.private_w3 = private_w3 if private_w3 else w3
         self.trade_logger = TradeLogger()
+        # Lazy import to avoid circular import; initialized on first use
+        self._approval_manager = None
         self.execution_stats = {
             "total_executions": 0,
             "successful": 0,
@@ -122,6 +155,35 @@ class AtomicArbExecutor:
             "total_profit_usd": 0.0,
             "total_gas_spent_usd": 0.0
         }
+
+    def _get_approval_manager(self):
+        """Lazy-init TokenApprovalManager to avoid circular import."""
+        if self._approval_manager is None:
+            from execution.token_approval import TokenApprovalManager
+            self._approval_manager = TokenApprovalManager(self.w3)
+        return self._approval_manager
+
+    async def ensure_token_approval(
+        self,
+        token_address: str,
+        spender: str,
+        amount: int,
+        wallet_address: str,
+        private_key: str,
+        gas_price_wei: Optional[int] = None
+    ) -> bool:
+        """
+        Ensure `wallet_address` has approved `spender` to spend at least `amount` of `token_address`.
+        Returns True if already approved or approval succeeds, False otherwise.
+        """
+        mgr = self._get_approval_manager()
+        result = await mgr.ensure_approval(
+            token_address, spender, wallet_address, amount, private_key, gas_price_wei
+        )
+        if not result.get("success"):
+            logger.error(f"Approval failed for {token_address} → {spender}: {result.get('error')}")
+            return False
+        return True
 
     def get_token_balance(self, token_address: str, wallet_address: str) -> int:
         """Get current ERC20 token balance for wallet."""
@@ -226,8 +288,9 @@ class AtomicArbExecutor:
             result["dex_fees_usd"]      = dex_fees
             result["slippage_cost_usd"] = slippage
 
-            # ── Net profit (ALL four costs deducted) ──────────────────
-            net_profit = gross_profit_usd - gas_cost - dex_fees - slippage
+            # ── Net profit (ALL five costs deducted incl. MEV buffer) ──
+            mev_cost    = gross_profit_usd * MEV_COST_FRACTION  # 15% sandwich risk
+            net_profit  = gross_profit_usd - gas_cost - dex_fees - slippage - mev_cost
             result["net_profit_usd"] = net_profit
 
             if net_profit < MIN_NET_PROFIT_USD:
@@ -276,9 +339,9 @@ class AtomicArbExecutor:
                 checksummed_path      = [Web3.to_checksum_address(a) for a in path]
                 checksummed_recipient = Web3.to_checksum_address(recipient)
 
-                # Fresh gas price each attempt, escalated per retry
+                # Fresh gas price each attempt, escalated exponentially per retry
                 base_gas = gas_price_wei if gas_price_wei else w3_to_use.eth.gas_price
-                gas_price = int(base_gas * (1 + GAS_INCREASE_PER_RETRY * attempt))
+                gas_price = int(base_gas * (1.3 ** attempt))
 
                 deadline = int(time.time()) + deadline_seconds
 
@@ -375,6 +438,11 @@ class AtomicArbExecutor:
                 result["error"] = f"Invalid pair format: '{pair}'"
                 return result
 
+            # ── Per-pair success rate guard ───────────────────────────
+            if self.trade_logger.should_skip_pair(pair):
+                result["error"] = f"Pair {pair} skipped: historically low success rate"
+                return result
+
             from core.constants import TOKENS, DYNAMIC_TOKENS
             token_in_info  = TOKENS.get(tokens[0]) or DYNAMIC_TOKENS.get(tokens[0])
             token_out_info = TOKENS.get(tokens[1]) or DYNAMIC_TOKENS.get(tokens[1])
@@ -390,8 +458,17 @@ class AtomicArbExecutor:
 
             buy_dex  = opportunity.get("buy_dex",  "Kodiak V2")
             sell_dex = opportunity.get("sell_dex", "BEX")
-            buy_router  = KODIAK_V2_ROUTER if "Kodiak" in buy_dex  else BEX_ROUTER
-            sell_router = KODIAK_V2_ROUTER if "Kodiak" in sell_dex else BEX_ROUTER
+
+            def _dex_to_router(dex_name: str) -> str:
+                if dex_name == "Kodiak V3":
+                    return KODIAK_V3_ROUTER
+                elif dex_name == "BEX":
+                    return BEX_ROUTER
+                else:
+                    return KODIAK_V2_ROUTER  # Kodiak V2 or default
+
+            buy_router  = _dex_to_router(buy_dex)
+            sell_router = _dex_to_router(sell_dex)
 
             # ── Fresh gas price at execution time ─────────────────────
             try:
@@ -422,12 +499,25 @@ class AtomicArbExecutor:
                 f"slip={verification['slippage_cost_usd']:.4f})"
             )
 
-            # ── Step 2: Slippage floors ───────────────────────────────
+            # ── Step 2: Ensure token approval (buy router needs to spend token_in) ──
+            approved = await self.ensure_token_approval(
+                token_in_info["address"],
+                buy_router,
+                amount_in,
+                wallet_address,
+                private_key,
+                gas_price
+            )
+            if not approved:
+                result["error"] = f"Token approval failed for {token_in_info['symbol']} → {buy_dex}"
+                return result
+
+            # ── Step 3: Slippage floors ───────────────────────────────
             slippage_factor     = 1 - (slippage_tolerance / 100)
             buy_amount_out_min  = int(verification["buy_output"]  * slippage_factor)
             # sell_amount_out_min will be recalculated after actual balance read
 
-            # ── Step 3: Execute buy ───────────────────────────────────
+            # ── Step 4: Execute buy ───────────────────────────────────
             buy_result = await self.execute_swap(
                 router_address  = buy_router,
                 amount_in       = amount_in,
@@ -476,7 +566,24 @@ class AtomicArbExecutor:
 
             logger.info(f"[{trade_id}] Actual received: {actual_received} {token_out_info['symbol']}")
 
-            # ── Step 5: Execute sell using ACTUAL balance ─────────────
+            # ── Step 5: Ensure sell router approval (token_out → sell_router) ──
+            sell_approved = await self.ensure_token_approval(
+                token_out_info["address"],
+                sell_router,
+                actual_received,
+                wallet_address,
+                private_key,
+                gas_price
+            )
+            if not sell_approved:
+                result["error"] = (
+                    f"ABORT: Sell token approval failed for {token_out_info['symbol']} → {sell_dex}. "
+                    f"You hold {actual_received} {token_out_info['symbol']} — approve manually then sell."
+                )
+                logger.error(result["error"])
+                return result
+
+            # ── Step 6: Execute sell using ACTUAL balance ─────────────
             # Scale the sell minimum proportionally to what we actually received
             scale = actual_received / max(verification["buy_output"], 1)
             sell_amount_out_min = int(verification["sell_output"] * scale * slippage_factor)
@@ -581,7 +688,7 @@ class AtomicArbExecutor:
             for attempt in range(MAX_RETRY_ATTEMPTS):
                 result["attempts"] = attempt + 1
                 try:
-                    gas_price = int(base_gas * (1 + GAS_INCREASE_PER_RETRY * attempt))
+                    gas_price = int(base_gas * (1.3 ** attempt))
                     nonce = w3_to_use.eth.get_transaction_count(checksummed_recipient)
 
                     tx = bex_router.functions.swap(
@@ -618,6 +725,92 @@ class AtomicArbExecutor:
                 except Exception as e:
                     result["error"] = str(e)
                     logger.warning(f"BEX swap attempt {attempt+1} failed: {e}")
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    async def execute_v3_swap(
+        self,
+        token_in_address: str,
+        token_out_address: str,
+        amount_in: int,
+        min_out: int,
+        recipient: str,
+        private_key: str,
+        gas_price_wei: Optional[int] = None,
+        use_private_rpc: bool = True,
+        fee: int = 3000,  # default 0.3% pool; will try all tiers
+    ) -> Dict:
+        """
+        Execute a swap on Kodiak V3 (UniswapV3-style) using exactInputSingle.
+        Tries fee tiers in order: 3000 → 500 → 10000 (most liquid first).
+        """
+        result = {
+            "success": False, "tx_hash": None, "gas_used": 0,
+            "actual_output": 0, "error": None, "attempts": 0
+        }
+        w3_to_use = self.private_w3 if use_private_rpc and PRIVATE_RPC_URL else self.w3
+
+        try:
+            in_cs  = Web3.to_checksum_address(token_in_address)
+            out_cs = Web3.to_checksum_address(token_out_address)
+            recip  = Web3.to_checksum_address(recipient)
+            base_gas = gas_price_wei if gas_price_wei else w3_to_use.eth.gas_price
+
+            v3_router = w3_to_use.eth.contract(
+                address=Web3.to_checksum_address(KODIAK_V3_ROUTER),
+                abi=KODIAK_V3_ROUTER_ABI
+            )
+
+            # Try fee tiers in order of typical liquidity depth
+            fee_tiers_to_try = [3000, 500, 10000]
+
+            for attempt in range(MAX_RETRY_ATTEMPTS):
+                result["attempts"] = attempt + 1
+                fee_tier = fee_tiers_to_try[attempt % len(fee_tiers_to_try)]
+                try:
+                    gas_price_attempt = int(base_gas * (1.3 ** attempt))
+                    nonce    = w3_to_use.eth.get_transaction_count(recip)
+                    deadline = int(time.time()) + 120
+
+                    params_tuple = (
+                        in_cs,           # tokenIn
+                        out_cs,          # tokenOut
+                        fee_tier,        # fee
+                        recip,           # recipient
+                        deadline,        # deadline
+                        amount_in,       # amountIn
+                        min_out,         # amountOutMinimum
+                        0,               # sqrtPriceLimitX96 (0 = no limit)
+                    )
+
+                    tx = v3_router.functions.exactInputSingle(
+                        params_tuple
+                    ).build_transaction({
+                        'chainId':  w3_to_use.eth.chain_id,
+                        'gas':      GAS_PER_SWAP,
+                        'gasPrice': gas_price_attempt,
+                        'nonce':    nonce,
+                        'value':    0,
+                    })
+                    signed_tx = w3_to_use.eth.account.sign_transaction(tx, private_key)
+                    tx_hash   = w3_to_use.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    receipt   = w3_to_use.eth.wait_for_transaction_receipt(
+                        tx_hash, timeout=TRADE_TIMEOUT_SECONDS
+                    )
+                    if receipt['status'] == 1:
+                        result["success"]  = True
+                        result["tx_hash"]  = tx_hash.hex()
+                        result["gas_used"] = receipt['gasUsed']
+                        logger.info(f"Kodiak V3 swap confirmed (fee={fee_tier}): {tx_hash.hex()}")
+                        return result
+                    else:
+                        result["error"] = f"V3 tx reverted (fee={fee_tier})"
+                except Exception as e:
+                    result["error"] = str(e)
+                    logger.warning(f"V3 swap attempt {attempt+1} failed: {e}")
                 if attempt < MAX_RETRY_ATTEMPTS - 1:
                     await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
         except Exception as e:
@@ -708,7 +901,8 @@ class AtomicArbExecutor:
             dex_fees   = amount_usd * (DEX_FEE_PERCENT / 100) * n_swaps
             slippage_c = amount_usd * (slippage_tolerance / 100) * n_swaps * 0.5
 
-            net_profit = gross_profit - total_gas_cost - dex_fees - slippage_c
+            mev_cost_tri = gross_profit * MEV_COST_FRACTION  # 15% sandwich risk buffer
+            net_profit = gross_profit - total_gas_cost - dex_fees - slippage_c - mev_cost_tri
             if net_profit < MIN_NET_PROFIT_USD:
                 result["error"] = f"Pre-execution net profit ${net_profit:.4f} < floor"
                 return result
@@ -721,7 +915,8 @@ class AtomicArbExecutor:
 
             for i, leg in enumerate(legs):
                 dex_name   = opportunity.get("dexes", ["Kodiak V2"] * n_swaps)[i] if opportunity.get("dexes") else "Kodiak V2"
-                use_bex    = "BEX" in dex_name
+                use_bex    = dex_name == "BEX"
+                use_v3     = dex_name == "Kodiak V3"
                 amount_out_min = int(leg["sim_out"] * slippage_factor)
 
                 if use_bex:
@@ -730,6 +925,17 @@ class AtomicArbExecutor:
                         current_amount, amount_out_min,
                         wallet_address, private_key,
                         gas_price_wei=gas_price, use_private_rpc=use_private_rpc
+                    )
+                elif use_v3:
+                    swap_result = await self.execute_v3_swap(
+                        token_in_address=leg["tok_in"]["address"],
+                        token_out_address=leg["tok_out"]["address"],
+                        amount_in=current_amount,
+                        min_out=amount_out_min,
+                        recipient=wallet_address,
+                        private_key=private_key,
+                        gas_price_wei=gas_price,
+                        use_private_rpc=use_private_rpc
                     )
                 else:
                     swap_result = await self.execute_swap(

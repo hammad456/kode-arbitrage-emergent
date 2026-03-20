@@ -14,6 +14,10 @@ KODIAK_V3_ROUTER = "0xEd158C4b336A6FCb5B193A5570e3a571f6cbe690"
 KODIAK_V2_ROUTER = "0xd91dd58387Ccd9B66B390ae2d7c66dBD46BC6022"
 KODIAK_V2_FACTORY = "0x5C346464d33F90bABaf70dB6388507CC889C1070"
 KODIAK_QUOTER = "0x644C8D6E501f7C994B74F5ceA96abe65d0BA662B"
+# Alias: KODIAK_V3_QUOTER is the same address as KODIAK_QUOTER
+KODIAK_V3_QUOTER = "0x644C8D6E501f7C994B74F5ceA96abe65d0BA662B"
+# Common V3 fee tiers (Kodiak V3 uses the same fee tiers as Uniswap V3)
+KODIAK_V3_FEE_TIERS = [500, 3000, 10000]  # 0.05%, 0.3%, 1%
 
 # BEX (Berachain Exchange) - Official Addresses
 BEX_ROUTER = "0x21e2C0AFd058A89FCf7caf3aEA3cB84Ae977B73D"  # BEX CrocSwap Router
@@ -59,9 +63,9 @@ DYNAMIC_TOKENS: dict = {}
 MAX_TRADE_SIZE_USD = 10000
 MAX_GAS_LIMIT = 500000
 TRADE_TIMEOUT_SECONDS = 120
-# Minimum profit floors (raised from $0.0005 to provide real safety margin)
-MIN_PROFIT_THRESHOLD = 0.01    # $0.01 scanner filter (show only real opportunities)
-MIN_NET_PROFIT_USD   = 0.01    # $0.01 executor hard floor (never execute below this)
+# Minimum profit floors — must exceed gas + fees + MEV risk
+MIN_PROFIT_THRESHOLD = 0.50    # $0.50 scanner filter (only real, net-positive ops)
+MIN_NET_PROFIT_USD   = 0.50    # $0.50 executor hard floor (never execute below this)
 MIN_SPREAD_THRESHOLD = 0.10    # 0.10% spread — covers 2×0.3% DEX fee + buffer
 MAX_SLIPPAGE_PERCENT = 3.0     # tighter than before (was 5.0)
 PRICE_CHANGE_TOLERANCE = 2.0
@@ -69,6 +73,8 @@ GAS_BUFFER_MULTIPLIER = 1.3
 MAX_PRICE_IMPACT_PERCENT = 2.0  # tighter (was 3.0)
 MIN_LIQUIDITY_USD = 500         # raised from $200 — low-liq pairs are dangerous
 DEX_FEE_PERCENT = 0.3  # Default 0.3% DEX fee
+# MEV protection: reserve 15% of gross spread as sandwich-risk buffer
+MEV_COST_FRACTION = 0.15  # 15% of gross profit reserved for MEV risk
 
 # Multi-hop config
 MAX_HOP_COUNT = 4
@@ -77,7 +83,7 @@ MULTI_HOP_GAS_PER_SWAP = 150000
 # Retry Configuration
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY = 1.0  # seconds
-GAS_INCREASE_PER_RETRY = 0.20  # 20% increase per retry
+GAS_INCREASE_PER_RETRY = 0.30  # 30% base for exponential: gas * 1.3^attempt
 
 # MAX_UINT256 for infinite approval
 MAX_UINT256 = 2**256 - 1

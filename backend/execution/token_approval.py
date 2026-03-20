@@ -81,8 +81,8 @@ class TokenApprovalManager:
                 else:
                     gas_price = gas_price_wei
                 
-                # Increase gas by 20% per retry
-                gas_price = int(gas_price * (1 + GAS_INCREASE_PER_RETRY * attempt))
+                # Increase gas exponentially per retry (×1.3^attempt)
+                gas_price = int(gas_price * (1.3 ** attempt))
                 
                 # Build approval transaction
                 nonce = self.w3.eth.get_transaction_count(Web3.to_checksum_address(owner))

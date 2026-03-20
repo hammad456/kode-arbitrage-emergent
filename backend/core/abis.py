@@ -88,6 +88,64 @@ FLASH_ARB_ABI_MINIMAL = json.loads('''[
     {"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"tokenIn","type":"address"},{"indexed":true,"internalType":"address","name":"tokenOut","type":"address"},{"indexed":false,"internalType":"uint256","name":"amountIn","type":"uint256"},{"indexed":false,"internalType":"uint256","name":"profit","type":"uint256"}],"name":"DirectArbExecuted","type":"event"}
 ]''')
 
+# Kodiak V3 QuoterV2 ABI — used for accurate quotes on concentrated liquidity pools.
+# The V3 router does NOT support getAmountsOut; quotes must go through the Quoter.
+# Kodiak Quoter address: 0x644C8D6E501f7C994B74F5ceA96abe65d0BA662B
+KODIAK_V3_QUOTER_ABI = json.loads('''[
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType":"address","name":"tokenIn","type":"address"},
+                    {"internalType":"address","name":"tokenOut","type":"address"},
+                    {"internalType":"uint256","name":"amountIn","type":"uint256"},
+                    {"internalType":"uint24","name":"fee","type":"uint24"},
+                    {"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}
+                ],
+                "internalType":"struct IQuoterV2.QuoteExactInputSingleParams",
+                "name":"params",
+                "type":"tuple"
+            }
+        ],
+        "name": "quoteExactInputSingle",
+        "outputs": [
+            {"internalType":"uint256","name":"amountOut","type":"uint256"},
+            {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+            {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+            {"internalType":"uint256","name":"gasEstimate","type":"uint256"}
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }
+]''')
+
+# Uniswap V3 SwapRouter ABI — for executing swaps on Kodiak V3
+KODIAK_V3_ROUTER_ABI = json.loads('''[
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType":"address","name":"tokenIn","type":"address"},
+                    {"internalType":"address","name":"tokenOut","type":"address"},
+                    {"internalType":"uint24","name":"fee","type":"uint24"},
+                    {"internalType":"address","name":"recipient","type":"address"},
+                    {"internalType":"uint256","name":"deadline","type":"uint256"},
+                    {"internalType":"uint256","name":"amountIn","type":"uint256"},
+                    {"internalType":"uint256","name":"amountOutMinimum","type":"uint256"},
+                    {"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"}
+                ],
+                "internalType":"struct ISwapRouter.ExactInputSingleParams",
+                "name":"params",
+                "type":"tuple"
+            }
+        ],
+        "name": "exactInputSingle",
+        "outputs": [{"internalType":"uint256","name":"amountOut","type":"uint256"}],
+        "stateMutability": "payable",
+        "type": "function"
+    }
+]''')
+
 # Uniswap V2 Pair ABI for Flash Swap
 FLASH_PAIR_ABI = json.loads('''[
     {"constant":true,"inputs":[],"name":"getReserves","outputs":[{"name":"_reserve0","type":"uint112"},{"name":"_reserve1","type":"uint112"},{"name":"_blockTimestampLast","type":"uint32"}],"type":"function"},

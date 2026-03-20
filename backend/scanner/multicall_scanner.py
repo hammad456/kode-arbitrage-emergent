@@ -13,13 +13,15 @@ from eth_abi import decode
 import math
 
 from core.constants import (
-    TOKENS, KODIAK_V2_ROUTER, KODIAK_V2_FACTORY, KODIAK_V3_ROUTER, BEX_ROUTER, BEX_QUERY,
+    TOKENS, KODIAK_V2_ROUTER, KODIAK_V2_FACTORY, KODIAK_V3_ROUTER, KODIAK_V3_QUOTER,
+    KODIAK_V3_FEE_TIERS, BEX_ROUTER, BEX_QUERY,
     MULTICALL3_ADDRESS, MIN_SPREAD_THRESHOLD, MIN_PROFIT_THRESHOLD,
     MIN_LIQUIDITY_USD, MAX_PRICE_IMPACT_PERCENT, DEX_FEE_PERCENT,
     GAS_BUFFER_MULTIPLIER, STABLE_ADDRESSES, TOKEN_BY_ADDRESS, DYNAMIC_TOKENS
 )
 from core.abis import (
-    ROUTER_V2_ABI, MULTICALL_ABI, PAIR_ABI, FACTORY_ABI, BEX_QUERY_ABI, ERC20_ABI
+    ROUTER_V2_ABI, MULTICALL_ABI, PAIR_ABI, FACTORY_ABI, BEX_QUERY_ABI, ERC20_ABI,
+    KODIAK_V3_QUOTER_ABI
 )
 
 # BEX CrocSwap pool index (Berachain mainnet default)
@@ -270,6 +272,39 @@ class RealPriceScanner:
             logger.debug(f"BEX previewSwap error: {e}")
             return None
 
+    async def get_kodiak_v3_quote(
+        self,
+        token_in: str,
+        token_out: str,
+        amount_in: int,
+    ) -> Optional[int]:
+        """
+        Get quote from Kodiak V3 using QuoterV2.quoteExactInputSingle.
+        Tries all fee tiers (500, 3000, 10000) and returns the best output.
+        Uses eth_call (no gas spent).
+        """
+        quoter = self.w3.eth.contract(
+            address=Web3.to_checksum_address(KODIAK_V3_QUOTER),
+            abi=KODIAK_V3_QUOTER_ABI
+        )
+        best_out = 0
+        for fee in KODIAK_V3_FEE_TIERS:
+            try:
+                params = (
+                    Web3.to_checksum_address(token_in),
+                    Web3.to_checksum_address(token_out),
+                    amount_in,
+                    fee,
+                    0  # sqrtPriceLimitX96 = 0 means no limit
+                )
+                result = quoter.functions.quoteExactInputSingle(params).call()
+                amount_out = result[0]  # first return value is amountOut
+                if amount_out > best_out:
+                    best_out = amount_out
+            except Exception:
+                continue
+        return best_out if best_out > 0 else None
+
     async def batch_get_quotes(
         self,
         quote_requests: List[Dict]
@@ -289,12 +324,16 @@ class RealPriceScanner:
         if not quote_requests:
             return []
 
-        # Separate BEX (CrocSwap) requests from standard V2 requests
+        # Separate requests by DEX type
         bex_indices = []
+        v3_indices = []
         v2_indices = []
         for i, req in enumerate(quote_requests):
-            if req["router"].lower() == BEX_ROUTER.lower():
+            router_lower = req["router"].lower()
+            if router_lower == BEX_ROUTER.lower():
                 bex_indices.append(i)
+            elif router_lower == KODIAK_V3_ROUTER.lower():
+                v3_indices.append(i)
             else:
                 v2_indices.append(i)
 
@@ -334,6 +373,31 @@ class RealPriceScanner:
                             pass
             except Exception as e:
                 logger.error(f"Batch V2 quotes error: {e}")
+
+        # --- Handle Kodiak V3 via QuoterV2 (NOT V2 router getAmountsOut) ---
+        if v3_indices:
+            v3_tasks = [
+                self.get_kodiak_v3_quote(
+                    quote_requests[i]["token_in"],
+                    quote_requests[i]["token_out"],
+                    quote_requests[i]["amount_in"]
+                )
+                for i in v3_indices
+            ]
+            try:
+                import asyncio as _asyncio
+                v3_results = await _asyncio.gather(*v3_tasks, return_exceptions=True)
+                for j, orig_idx in enumerate(v3_indices):
+                    amount_out = v3_results[j]
+                    if isinstance(amount_out, int) and amount_out > 0:
+                        quotes[orig_idx] = {
+                            "amount_in": quote_requests[orig_idx]["amount_in"],
+                            "amount_out": amount_out,
+                            "router": KODIAK_V3_ROUTER,
+                            "success": True
+                        }
+            except Exception as e:
+                logger.error(f"Kodiak V3 quotes error: {e}")
 
         # --- Handle BEX (CrocSwap) via previewSwap ---
         if bex_indices:
@@ -527,42 +591,85 @@ class RealPriceScanner:
                     if dex_a_price == 0 or dex_b_price == 0:
                         continue
                     
-                    # Determine arbitrage direction
+                    # Determine arbitrage direction: buy on cheaper DEX (less output), sell on dearer DEX
                     if dex_a_price > dex_b_price:
                         buy_dex, sell_dex = dex_b_name, dex_a_name
                         buy_price, sell_price = dex_b_price, dex_a_price
-                        buy_out, sell_out = dex_b_out, dex_a_out
+                        buy_out = dex_b_out   # token_b received after buying at DEX_b
+                        sell_router_name = dex_a_name
                     else:
                         buy_dex, sell_dex = dex_a_name, dex_b_name
                         buy_price, sell_price = dex_a_price, dex_b_price
-                        buy_out, sell_out = dex_a_out, dex_b_out
-                
-                    # Calculate spread
+                        buy_out = dex_a_out   # token_b received after buying at DEX_a
+                        sell_router_name = dex_b_name
+
+                    # Calculate spread (directional signal only)
                     spread_percent = ((sell_price - buy_price) / buy_price) * 100
-                    
+
                     if spread_percent < MIN_SPREAD_THRESHOLD:
                         continue
-                    
+
+                    # ── Round-trip profit simulation ─────────────────────────
+                    # Step 1: We spend amount_in token_a → receive buy_out token_b (at buy_dex)
+                    # Step 2: We sell buy_out token_b → receive token_a back (at sell_dex)
+                    # Determine which router to use for the sell step
+                    if sell_router_name == "Kodiak V2":
+                        sell_router_addr = KODIAK_V2_ROUTER
+                    elif sell_router_name == "Kodiak V3":
+                        sell_router_addr = KODIAK_V3_ROUTER
+                    else:
+                        sell_router_addr = BEX_ROUTER
+
+                    # Get actual sell quote: how much token_a do we get back for buy_out token_b?
+                    if sell_router_name == "BEX":
+                        sell_back_out = await self.get_bex_quote(
+                            token_b["address"], token_a["address"], buy_out
+                        )
+                    else:
+                        try:
+                            sell_router_contract = self.w3.eth.contract(
+                                address=Web3.to_checksum_address(sell_router_addr),
+                                abi=ROUTER_V2_ABI
+                            )
+                            _sell_amts = sell_router_contract.functions.getAmountsOut(
+                                buy_out,
+                                [Web3.to_checksum_address(token_b["address"]),
+                                 Web3.to_checksum_address(token_a["address"])]
+                            ).call()
+                            sell_back_out = _sell_amts[-1] if _sell_amts else None
+                        except Exception:
+                            sell_back_out = None
+
+                    if not sell_back_out or sell_back_out <= 0:
+                        continue
+
+                    # Gross profit in token_a units
+                    raw_profit_raw = sell_back_out - amount_in
+                    if raw_profit_raw <= 0:
+                        continue
+
+                    token_a_price = bera_price_usd if meta["symbol_a"] == "WBERA" else 1.0
+                    raw_profit_usd = (raw_profit_raw / (10 ** token_a["decimals"])) * token_a_price
+
                     # Calculate profits with real costs (250k per swap — consistent with executor)
                     total_gas = 250000 * 2  # Two swaps
                     gas_cost_usd = (total_gas * gas_price_wei / 10**18) * bera_price_usd
-                    
-                    # Token price for USD conversion
-                    token_price = bera_price_usd if meta["symbol_a"] == "WBERA" else 1.0
-                    
-                    # Gross profit
-                    profit_tokens = (sell_out - buy_out) / (10 ** token_b["decimals"])
-                    token_out_price = bera_price_usd if meta["symbol_b"] == "WBERA" else 1.0
-                    raw_profit_usd = profit_tokens * token_out_price
-                    
-                    # DEX fees (0.3% * 2 swaps)
-                    dex_fees_usd = amount_in_decimal * token_price * (DEX_FEE_PERCENT / 100) * 2
-                    
-                    # Slippage estimate
-                    slippage_cost_usd = amount_in_decimal * token_price * 0.005
-                    
-                    # Net profit
+
+                    # Token price for USD conversion (for DEX fee calc on input amount)
+                    token_price = token_a_price
+
+                    # DEX fees (0.3% * 2 swaps — on the input amounts)
+                    amount_in_decimal_a = amount_in / (10 ** token_a["decimals"])
+                    dex_fees_usd = amount_in_decimal_a * token_price * (DEX_FEE_PERCENT / 100) * 2
+
+                    # Slippage estimate (0.5% of trade size)
+                    slippage_cost_usd = amount_in_decimal_a * token_price * 0.005
+
+                    # Net profit (all costs deducted from round-trip gross profit)
                     net_profit_usd = raw_profit_usd - gas_cost_usd - dex_fees_usd - slippage_cost_usd
+
+                    # Use sell_back_out as the "expected_out" (amount of token_a returned)
+                    sell_out = sell_back_out
                     
                     if net_profit_usd <= MIN_PROFIT_THRESHOLD:
                         continue
@@ -571,17 +678,27 @@ class RealPriceScanner:
                     pair_key_lookup = self._get_pair_key(token_a["address"], token_b["address"])
                     pair_addr = self.pair_cache.get(pair_key_lookup, "")
                     reserves = reserves_map.get(pair_addr, {})
-                    
+
                     liquidity_usd = 0
                     if reserves:
                         if meta["symbol_a"] == "WBERA":
                             liquidity_usd = (reserves.get("reserve0", 0) / 10**18) * bera_price_usd * 2
+                        elif meta["symbol_a"] in ("USDC", "USDT", "NECT", "STGUSDC"):
+                            liquidity_usd = (reserves.get("reserve0", 0) / (10 ** token_a["decimals"])) * 2
                         else:
                             liquidity_usd = (reserves.get("reserve0", 0) / (10 ** token_a["decimals"])) * 2
-                    
+
                     if liquidity_usd < MIN_LIQUIDITY_USD:
                         continue
-                    
+
+                    # Price impact based on actual reserve depth
+                    price_impact = 0.0
+                    if reserves and reserves.get("reserve0", 0) > 0:
+                        price_impact = min(
+                            (amount_in / max(reserves.get("reserve0", amount_in * 10), 1)) * 100,
+                            MAX_PRICE_IMPACT_PERCENT
+                        )
+
                     # Create opportunity
                     import uuid
                     opp = {
@@ -599,11 +716,12 @@ class RealPriceScanner:
                         "slippage_cost_usd": slippage_cost_usd,
                         "net_profit_usd": net_profit_usd,
                         "amount_in": str(amount_in),
-                        "expected_out": str(sell_out),
+                        "expected_out": str(sell_out),   # token_a returned after round-trip
                         "token_in_address": token_a["address"],
-                        "token_out_address": token_b["address"],
+                        "token_out_address": token_a["address"],  # round-trip: same token in/out
+                        "intermediate_token": token_b["address"],
                         "liquidity_usd": liquidity_usd,
-                        "price_impact": min(amount_in_decimal / 1000, MAX_PRICE_IMPACT_PERCENT),
+                        "price_impact": price_impact,
                         "timestamp": time.time()
                     }
                     
@@ -902,51 +1020,92 @@ class RealPriceScanner:
                     if out_a == 0 or out_b == 0:
                         continue
 
-                    # Determine cheaper/dearer DEX
+                    # Determine cheaper/dearer DEX (buy on lower output = cheaper)
                     if out_a >= out_b:
                         buy_dex, sell_dex = dex_b, dex_a
-                        buy_out, sell_out = out_b, out_a
+                        buy_out = out_b   # token1 received for token0 at cheap DEX
+                        sell_dex_name = dex_a
                     else:
                         buy_dex, sell_dex = dex_a, dex_b
-                        buy_out, sell_out = out_a, out_b
+                        buy_out = out_a
+                        sell_dex_name = dex_b
 
                     amount_in = m["amount_in"]
                     dec_in  = m["decimals0"]
                     dec_out = m["decimals1"]
-                    spread = (sell_out - buy_out) / max(buy_out, 1) * 100
+
+                    # Spread is a signal — not yet profit
+                    spread = (max(out_a, out_b) - min(out_a, out_b)) / max(min(out_a, out_b), 1) * 100
                     if spread < MIN_SPREAD_THRESHOLD:
                         continue
 
-                    # Optimal sizing (V2-V2 only; skip for V3/BEX)
+                    # ── Round-trip simulation ─────────────────────────────────
+                    # We have buy_out of token1 after the buy leg.
+                    # Now simulate selling buy_out token1 → token0 at sell_dex.
+                    sell_back_router = (KODIAK_V2_ROUTER if sell_dex_name == "Kodiak V2"
+                                        else KODIAK_V3_ROUTER if sell_dex_name == "Kodiak V3"
+                                        else BEX_ROUTER)
+                    sell_back_out = None
+                    if sell_dex_name == "BEX":
+                        sell_back_out = await self.get_bex_quote(
+                            m["token1"], m["token0"], buy_out
+                        )
+                    else:
+                        try:
+                            _r = self.w3.eth.contract(
+                                address=Web3.to_checksum_address(sell_back_router),
+                                abi=ROUTER_V2_ABI
+                            )
+                            _amts = _r.functions.getAmountsOut(
+                                buy_out,
+                                [Web3.to_checksum_address(m["token1"]),
+                                 Web3.to_checksum_address(m["token0"])]
+                            ).call()
+                            sell_back_out = _amts[-1] if _amts else None
+                        except Exception:
+                            sell_back_out = None
+
+                    if not sell_back_out or sell_back_out <= 0:
+                        continue
+
+                    # Gross profit in token0 units
+                    raw_profit_raw = sell_back_out - amount_in
+                    if raw_profit_raw <= 0:
+                        continue
+
+                    # Optimal sizing only for V2-V2 (closed-form formula)
                     optimal_in = amount_in
                     if dex_a == "Kodiak V2" and dex_b == "Kodiak V2":
                         r0 = m.get("reserve0", 0)
                         r1 = m.get("reserve1", 0)
-                        if r0 and r1 and buy_out < sell_out:
-                            # buy DEX has lower reserves; use symmetric reserves estimate
+                        if r0 and r1:
                             opt = self.calc_optimal_trade_size(r0, r1, r1, r0)
                             if opt > 0:
                                 optimal_in = opt
 
-                    # Profit estimate with optimal size (scale from 100-unit probe)
-                    scale = optimal_in / max(amount_in, 1)
-                    buy_out_scaled  = int(buy_out  * scale)
-                    sell_out_scaled = int(sell_out * scale)
-                    profit_tokens   = (sell_out_scaled - buy_out_scaled) / (10 ** dec_out)
-
-                    # USD conversion
-                    WBERA_ADDR = "0x6969696969696969696969696969696969696969"
-                    if m["token1"].lower() in STABLE_ADDRESSES:
-                        token_out_price = 1.0
-                    elif m["token1"].lower() == WBERA_ADDR.lower():
-                        token_out_price = bera_price_usd
+                    # Scale round-trip profit proportionally (probe: amount_in, actual: optimal_in)
+                    # For non-V2, keep probe amount to avoid incorrect linear scaling
+                    if optimal_in != amount_in:
+                        scale = optimal_in / max(amount_in, 1)
+                        raw_profit_raw_scaled = int(raw_profit_raw * scale * 0.9)  # 10% safety haircut
+                        optimal_in_final = optimal_in
                     else:
-                        token_out_price = 1.0  # conservative
+                        raw_profit_raw_scaled = raw_profit_raw
+                        optimal_in_final = amount_in
 
-                    raw_profit_usd = profit_tokens * token_out_price
-                    gas_usd = (300000 * 2 * gas_price_wei / 10**18) * bera_price_usd
-                    dex_fee_usd = (optimal_in / 10**dec_in) * token_out_price * (DEX_FEE_PERCENT / 100) * 2
-                    slip_usd = raw_profit_usd * 0.005
+                    # USD conversion for token0
+                    WBERA_ADDR = "0x6969696969696969696969696969696969696969"
+                    if m["token0"].lower() in STABLE_ADDRESSES:
+                        token_in_price = 1.0
+                    elif m["token0"].lower() == WBERA_ADDR.lower():
+                        token_in_price = bera_price_usd
+                    else:
+                        token_in_price = 1.0  # conservative
+
+                    raw_profit_usd = (raw_profit_raw_scaled / 10**dec_in) * token_in_price
+                    gas_usd = (250000 * 2 * gas_price_wei / 10**18) * bera_price_usd
+                    dex_fee_usd = (optimal_in_final / 10**dec_in) * token_in_price * (DEX_FEE_PERCENT / 100) * 2
+                    slip_usd = (optimal_in_final / 10**dec_in) * token_in_price * 0.005
 
                     net_profit = raw_profit_usd - gas_usd - dex_fee_usd - slip_usd
                     if net_profit <= MIN_PROFIT_THRESHOLD:
@@ -959,18 +1118,19 @@ class RealPriceScanner:
                         "buy_dex": buy_dex,
                         "sell_dex": sell_dex,
                         "buy_price": buy_out / max(amount_in, 1) * (10**dec_in / 10**dec_out),
-                        "sell_price": sell_out / max(amount_in, 1) * (10**dec_in / 10**dec_out),
+                        "sell_price": max(out_a, out_b) / max(amount_in, 1) * (10**dec_in / 10**dec_out),
                         "spread_percent": spread,
                         "potential_profit_usd": raw_profit_usd,
                         "gas_cost_usd": gas_usd,
                         "net_profit_usd": net_profit,
-                        "optimal_amount_in": str(optimal_in),
-                        "amount_in": str(optimal_in),
-                        "expected_out": str(sell_out_scaled),
+                        "optimal_amount_in": str(optimal_in_final),
+                        "amount_in": str(optimal_in_final),
+                        "expected_out": str(sell_back_out),   # token0 returned after round-trip
                         "token_in_address": m["token0"],
-                        "token_out_address": m["token1"],
+                        "token_out_address": m["token0"],     # round-trip: same token
+                        "intermediate_token": m["token1"],
                         "liquidity_usd": m.get("liquidity_usd", 0),
-                        "price_impact": min((optimal_in / max(m.get("reserve0", optimal_in*10), 1)) * 100, 5.0),
+                        "price_impact": min((optimal_in_final / max(m.get("reserve0", optimal_in_final * 10), 1)) * 100, 5.0),
                         "timestamp": time.time(),
                     })
 
