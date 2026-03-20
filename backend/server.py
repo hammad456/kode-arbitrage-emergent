@@ -1,3 +1,16 @@
+import warnings
+# Suppress urllib3/chardet version mismatch warnings from older system packages
+warnings.filterwarnings(
+    "ignore",
+    message="urllib3.*doesn't match a supported version",
+    category=Warning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=".*chardet.*doesn't match a supported version",
+    category=Warning,
+)
+
 from fastapi import FastAPI, APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
@@ -32,7 +45,9 @@ from core.constants import (
 from execution.token_approval import TokenApprovalManager
 from execution.atomic_executor import AtomicArbExecutor, TradeLogger
 from execution.flash_loan import FlashLoanExecutor
+from execution.zltra_engine import ZLTRAEngine
 from scanner.multicall_scanner import RealPriceScanner
+from scanner.pivot_detector import PivotPointDetector
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -56,6 +71,8 @@ atomic_executor = AtomicArbExecutor(w3, private_w3)
 flash_loan_executor = FlashLoanExecutor(w3)
 real_price_scanner = RealPriceScanner(w3)
 trade_logger = TradeLogger()
+zltra_engine = ZLTRAEngine(w3)
+pivot_detector = PivotPointDetector()
 
 # Production Mode Flag
 PRODUCTION_MODE = os.environ.get('PRODUCTION_MODE', 'false').lower() == 'true'
@@ -2565,12 +2582,40 @@ async def websocket_prices(websocket: WebSocket):
                 }
             }
             
+            # Feed prices into pivot detector
+            for opp in opportunities:
+                pair = opp.token_pair
+                if opp.buy_price > 0:
+                    pivot_detector.record_price(pair, opp.buy_price)
+
+            # Run ZLTRA scan every other cycle to reduce load
+            zltra_opps = []
+            if int(scan_start) % 4 < 2:  # ~every 4 seconds
+                try:
+                    zltra_opps = await zltra_engine.scan(
+                        gas_price_wei=gas_price,
+                        bera_price_usd=cache.token_prices.get("bera", 5.0),
+                    )
+                except Exception as ze:
+                    logger.debug(f"ZLTRA scan skipped: {ze}")
+
+            # Attach pivot signals to direct opportunities
+            opp_dicts = []
+            for o in opportunities:
+                d = o.model_dump()
+                sig, boost = pivot_detector.get_signal_for_opportunity(d)
+                d["pivot_signal"] = sig
+                d["pivot_boost"] = boost
+                opp_dicts.append(d)
+
             # Get best opportunity for auto-execution
             best_opp = opportunities[0] if opportunities else None
-            
+
             await websocket.send_json({
                 "type": "update",
-                "opportunities": [o.model_dump() for o in opportunities],
+                "opportunities": opp_dicts,
+                "zltra_opportunities": [zo.to_dict() for zo in zltra_opps[:5]],
+                "pivot_signals": pivot_detector.get_stats().get("signals", {}),
                 "gas": gas_data,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "scan_time_ms": int(scan_time * 1000),
@@ -2590,6 +2635,166 @@ async def websocket_prices(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
+
+# ============== ZLTRA ENDPOINTS ==============
+
+@api_router.get("/zltra/scan")
+async def zltra_scan():
+    """
+    ZLTRA: Zero-Loss Triangular Arbitrage with Instant Rebalance scan.
+
+    Returns all triangular arb opportunities that are:
+    - Fully simulated on-chain (eth_call, no gas spent)
+    - Profitable after flash loan fee + gas + slippage
+    - Ranked by net USD profit
+    """
+    try:
+        gas_price = w3.eth.gas_price
+        bera_price = await get_token_price_coingecko("berachain-bera")
+
+        opportunities = await zltra_engine.scan(
+            gas_price_wei=gas_price,
+            bera_price_usd=bera_price,
+        )
+
+        return {
+            "opportunities": [o.to_dict() for o in opportunities],
+            "count": len(opportunities),
+            "gas_price_gwei": round(gas_price / 10**9, 4),
+            "bera_price_usd": bera_price,
+            "engine_stats": zltra_engine.get_stats(),
+        }
+    except Exception as e:
+        logger.error(f"ZLTRA scan error: {e}")
+        return {
+            "error": str(e),
+            "opportunities": [],
+            "count": 0,
+        }
+
+
+@api_router.get("/zltra/stats")
+async def zltra_stats():
+    """ZLTRA engine statistics"""
+    return zltra_engine.get_stats()
+
+
+# ============== PIVOT POINT ENDPOINTS ==============
+
+@api_router.get("/pivot/levels")
+async def pivot_levels():
+    """
+    Get current pivot point levels for all tracked trading pairs.
+
+    Pivot levels are computed from rolling price observations during scans.
+    Signals: strong_buy, buy, neutral, sell, strong_sell
+    """
+    return {
+        "levels": pivot_detector.get_all_levels(),
+        "stats": pivot_detector.get_stats(),
+    }
+
+
+@api_router.get("/pivot/signal/{pair}")
+async def pivot_signal(pair: str):
+    """
+    Get pivot point signal for a specific pair (e.g. WBERA/USDC).
+    Returns signal and rank boost value.
+    """
+    opp_mock = {"token_pair": pair}
+    signal, boost = pivot_detector.get_signal_for_opportunity(opp_mock)
+    levels = pivot_detector.get_levels(pair)
+    return {
+        "pair": pair,
+        "signal": signal,
+        "rank_boost": boost,
+        "levels": levels.to_dict() if levels else None,
+    }
+
+
+# ============== ENHANCED SCAN WITH PIVOT + ZLTRA ==============
+
+@api_router.get("/scan/enhanced")
+async def scan_enhanced():
+    """
+    Enhanced arbitrage scan combining:
+    1. Direct DEX arbitrage (Kodiak V2/V3 vs BEX)
+    2. ZLTRA triangular opportunities with flash loan support
+    3. Pivot point signal integration for rank boosting
+
+    All opportunities are ranked by risk-adjusted, pivot-boosted profit.
+    """
+    try:
+        gas_price = w3.eth.gas_price
+        bera_price = await get_token_price_coingecko("berachain-bera")
+
+        # Run direct scan and ZLTRA scan concurrently
+        direct_opps_task = real_price_scanner.scan_arbitrage_opportunities(
+            gas_price_wei=gas_price,
+            bera_price_usd=bera_price,
+        )
+        zltra_opps_task = zltra_engine.scan(
+            gas_price_wei=gas_price,
+            bera_price_usd=bera_price,
+        )
+        direct_opps, zltra_opps = await asyncio.gather(
+            direct_opps_task, zltra_opps_task
+        )
+
+        # Feed prices into pivot detector for all direct opps
+        for opp in direct_opps:
+            pair = opp.get("token_pair", "")
+            buy_price = opp.get("buy_price", 0)
+            sell_price = opp.get("sell_price", 0)
+            if buy_price > 0:
+                pivot_detector.record_price(pair, buy_price)
+            if sell_price > 0:
+                pivot_detector.record_price(pair, sell_price)
+
+        # Apply pivot boost to direct opportunities
+        for opp in direct_opps:
+            _, boost = pivot_detector.get_signal_for_opportunity(opp)
+            opp["pivot_boost"] = boost
+            opp["rank_score"] = opp.get("rank_score", 0) + boost
+            signal, _ = pivot_detector.get_signal_for_opportunity(opp)
+            opp["pivot_signal"] = signal
+
+        # Convert ZLTRA opps to compatible format for unified list
+        zltra_dicts = []
+        for zo in zltra_opps:
+            d = zo.to_dict()
+            d["rank_score"] = min(
+                1.0,
+                zo.net_profit_usd / max(zo.net_profit_usd + 0.01, 0.01) * 0.9
+                + zo.execution_probability * 0.1,
+            )
+            d["pivot_signal"] = "neutral"
+            d["pivot_boost"] = 0.0
+            zltra_dicts.append(d)
+
+        # Merge and re-rank
+        all_opps = direct_opps + zltra_dicts
+        all_opps.sort(key=lambda x: x.get("rank_score", 0), reverse=True)
+
+        return {
+            "opportunities": all_opps,
+            "direct_count": len(direct_opps),
+            "zltra_count": len(zltra_opps),
+            "total_count": len(all_opps),
+            "gas_price_gwei": round(gas_price / 10**9, 4),
+            "bera_price_usd": bera_price,
+            "pivot_stats": pivot_detector.get_stats(),
+            "zltra_stats": zltra_engine.get_stats(),
+        }
+
+    except Exception as e:
+        logger.error(f"Enhanced scan error: {e}")
+        return {
+            "error": str(e),
+            "opportunities": [],
+            "total_count": 0,
+        }
+
 
 # Include router
 app.include_router(api_router)
