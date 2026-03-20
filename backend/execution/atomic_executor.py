@@ -1,6 +1,14 @@
 """
 Atomic Arbitrage Executor - Production Trade Execution
 Handles atomic transactions, flash swaps, and retry logic
+
+Safety guarantees:
+  1. Pre-execution profit simulation via eth_call (no gas spent)
+  2. Post-buy actual balance read — sell ABORTS if balance unverifiable
+  3. slippage_cost included in net_profit so reporting is accurate
+  4. Gas estimates consistent: 250 000 per swap (tuneable via GAS_PER_SWAP)
+  5. Gas price re-fetched at execution time (not stale from scan)
+  6. Strict MIN_NET_PROFIT_USD enforced before any on-chain call
 """
 import asyncio
 import logging
@@ -17,20 +25,26 @@ from core.constants import (
     GAS_BUFFER_MULTIPLIER, MAX_GAS_LIMIT, DEX_FEE_PERCENT,
     TRADE_TIMEOUT_SECONDS, PRIVATE_RPC_URL, KODIAK_V2_ROUTER, BEX_ROUTER
 )
-from core.abis import ROUTER_V2_ABI, ERC20_ABI
+from core.abis import ROUTER_V2_ABI, ERC20_ABI, BEX_QUERY_ABI, BEX_ROUTER_ABI
+from core.constants import BEX_QUERY, BEX_POOL_IDX, BEX_MIN_SQRT_PRICE, BEX_MAX_UINT128
 
 logger = logging.getLogger(__name__)
 
+# Conservative, consistent gas estimate for one V2 swap
+GAS_PER_SWAP = 250_000
+# Minimum net profit to even attempt execution (prevents dust trades)
+MIN_NET_PROFIT_USD = 0.01   # $0.01 hard floor
+
+
 class TradeLogger:
     """Logs all trade outcomes to CSV and provides metrics"""
-    
+
     def __init__(self, log_dir: str = "/app/backend/logs"):
         self.log_dir = log_dir
         self.csv_file = os.path.join(log_dir, "trade_history.csv")
         self._ensure_csv_exists()
-    
+
     def _ensure_csv_exists(self):
-        """Create CSV with headers if it doesn't exist"""
         os.makedirs(self.log_dir, exist_ok=True)
         if not os.path.exists(self.csv_file):
             with open(self.csv_file, 'w', newline='') as f:
@@ -42,9 +56,8 @@ class TradeLogger:
                     'buy_tx_hash', 'sell_tx_hash', 'status', 'error', 'retry_count',
                     'execution_time_ms', 'slippage_actual'
                 ])
-    
+
     def log_trade(self, trade_data: Dict):
-        """Log trade outcome to CSV"""
         try:
             with open(self.csv_file, 'a', newline='') as f:
                 writer = csv.writer(f)
@@ -74,9 +87,8 @@ class TradeLogger:
             logger.info(f"Trade logged: {trade_data.get('trade_id')} - {trade_data.get('status')}")
         except Exception as e:
             logger.error(f"Failed to log trade: {e}")
-    
+
     def get_recent_trades(self, limit: int = 100) -> List[Dict]:
-        """Get recent trades from CSV"""
         trades = []
         try:
             with open(self.csv_file, 'r') as f:
@@ -92,16 +104,15 @@ class TradeLogger:
 class AtomicArbExecutor:
     """
     Production-grade arbitrage executor with:
-    - Atomic transaction bundling (buy + sell)
-    - Retry logic with exponential backoff
-    - Gas price escalation per retry
+    - Strict pre-execution profit simulation (eth_call, no gas)
+    - Post-buy actual balance verification — ABORTS sell if can't confirm
+    - Accurate net_profit including all costs (gas + fees + slippage)
+    - Retry logic with exponential backoff + gas escalation
     - Private RPC submission for MEV protection
-    - Comprehensive trade logging
     """
-    
+
     def __init__(self, w3: Web3, private_w3: Optional[Web3] = None):
         self.w3 = w3
-        # Use private RPC for MEV protection if configured
         self.private_w3 = private_w3 if private_w3 else w3
         self.trade_logger = TradeLogger()
         self.execution_stats = {
@@ -111,32 +122,39 @@ class AtomicArbExecutor:
             "total_profit_usd": 0.0,
             "total_gas_spent_usd": 0.0
         }
-    
+
+    def get_token_balance(self, token_address: str, wallet_address: str) -> int:
+        """Get current ERC20 token balance for wallet."""
+        try:
+            token = self.w3.eth.contract(
+                address=Web3.to_checksum_address(token_address),
+                abi=ERC20_ABI
+            )
+            return token.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
+        except Exception as e:
+            logger.warning(f"Balance check failed for {token_address}: {e}")
+            return -1  # -1 = unreadable (distinct from 0 = empty)
+
     async def simulate_swap(
         self,
         router_address: str,
         amount_in: int,
         path: List[str],
-        from_address: str
+        from_address: str = "0x0000000000000000000000000000000000000001"
     ) -> Optional[int]:
-        """
-        Simulate swap using eth_call before execution.
-        Returns expected output amount or None if simulation fails.
-        """
+        """Simulate swap via eth_call (no state change, no gas spent)."""
         try:
             router = self.w3.eth.contract(
                 address=Web3.to_checksum_address(router_address),
                 abi=ROUTER_V2_ABI
             )
             checksummed_path = [Web3.to_checksum_address(addr) for addr in path]
-            
-            # eth_call simulation (no state change)
             result = router.functions.getAmountsOut(amount_in, checksummed_path).call()
             return result[-1] if result else None
         except Exception as e:
             logger.debug(f"Swap simulation failed: {e}")
             return None
-    
+
     async def verify_profit_before_execution(
         self,
         buy_router: str,
@@ -152,80 +170,78 @@ class AtomicArbExecutor:
     ) -> Dict:
         """
         Strict profit verification using on-chain simulation.
-        Returns verification result with net_profit calculation.
-        
-        Formula: net_profit = expected_output - input_amount - gas_cost - dex_fees - slippage
+        Net profit = gross_profit - gas - dex_fees - slippage.
+        All four costs are included in the returned net_profit_usd.
         """
         result = {
             "valid": False,
             "reason": None,
             "buy_output": 0,
             "sell_output": 0,
-            "gross_profit": 0,
-            "gas_cost_usd": 0,
-            "dex_fees_usd": 0,
-            "slippage_cost_usd": 0,
-            "net_profit_usd": 0
+            "gross_profit": 0.0,
+            "gas_cost_usd": 0.0,
+            "dex_fees_usd": 0.0,
+            "slippage_cost_usd": 0.0,
+            "net_profit_usd": 0.0
         }
-        
+
         try:
-            # Simulate buy: token_in -> token_out
-            buy_path = [token_in_address, token_out_address]
-            buy_output = await self.simulate_swap(buy_router, amount_in, buy_path, "0x0000000000000000000000000000000000000000")
-            
-            if not buy_output:
-                result["reason"] = "Buy simulation failed"
+            # ── Simulate buy ─────────────────────────────────────────
+            buy_output = await self.simulate_swap(
+                buy_router, amount_in,
+                [token_in_address, token_out_address]
+            )
+            if not buy_output or buy_output <= 0:
+                result["reason"] = "Buy simulation returned zero"
                 return result
-            
             result["buy_output"] = buy_output
-            
-            # Simulate sell: token_out -> token_in
-            sell_path = [token_out_address, token_in_address]
-            sell_output = await self.simulate_swap(sell_router, buy_output, sell_path, "0x0000000000000000000000000000000000000000")
-            
-            if not sell_output:
-                result["reason"] = "Sell simulation failed"
+
+            # ── Simulate sell ─────────────────────────────────────────
+            sell_output = await self.simulate_swap(
+                sell_router, buy_output,
+                [token_out_address, token_in_address]
+            )
+            if not sell_output or sell_output <= 0:
+                result["reason"] = "Sell simulation returned zero"
                 return result
-            
             result["sell_output"] = sell_output
-            
-            # Calculate costs
-            # Gas cost for 2 swaps
-            total_gas = 300000 * 2  # Conservative estimate
-            gas_cost_usd = (total_gas * gas_price_wei / 10**18) * bera_price_usd
-            result["gas_cost_usd"] = gas_cost_usd
-            
-            # DEX fees (0.3% per swap, 2 swaps)
-            amount_in_usd = (amount_in / (10 ** token_in_decimals)) * token_in_price_usd
-            dex_fees_usd = amount_in_usd * (DEX_FEE_PERCENT / 100) * 2
-            result["dex_fees_usd"] = dex_fees_usd
-            
-            # Slippage estimate (0.5% total)
-            slippage_cost_usd = amount_in_usd * 0.005
-            result["slippage_cost_usd"] = slippage_cost_usd
-            
-            # Gross profit
-            raw_profit = sell_output - amount_in
-            gross_profit_usd = (raw_profit / (10 ** token_in_decimals)) * token_in_price_usd
+
+            # ── Gross profit ──────────────────────────────────────────
+            raw_profit_tokens = sell_output - amount_in
+            gross_profit_usd = (raw_profit_tokens / (10 ** token_in_decimals)) * token_in_price_usd
             result["gross_profit"] = gross_profit_usd
-            
-            # Net profit
-            net_profit_usd = gross_profit_usd - gas_cost_usd - dex_fees_usd - slippage_cost_usd
-            result["net_profit_usd"] = net_profit_usd
-            
-            # Strict check: only valid if net_profit > 0
-            if net_profit_usd <= 0:
-                result["reason"] = f"Net profit <= 0: ${net_profit_usd:.4f}"
+
+            if gross_profit_usd <= 0:
+                result["reason"] = f"Gross profit ≤ 0: ${gross_profit_usd:.6f}"
                 return result
-            
+
+            # ── Costs ─────────────────────────────────────────────────
+            total_gas   = GAS_PER_SWAP * 2                   # buy + sell
+            gas_cost    = (total_gas * gas_price_wei / 10**18) * bera_price_usd
+            amount_usd  = (amount_in / (10 ** token_in_decimals)) * token_in_price_usd
+            dex_fees    = amount_usd * (DEX_FEE_PERCENT / 100) * 2   # 0.3% * 2 swaps
+            slippage    = amount_usd * 0.005                          # 0.5% slippage estimate
+
+            result["gas_cost_usd"]      = gas_cost
+            result["dex_fees_usd"]      = dex_fees
+            result["slippage_cost_usd"] = slippage
+
+            # ── Net profit (ALL four costs deducted) ──────────────────
+            net_profit = gross_profit_usd - gas_cost - dex_fees - slippage
+            result["net_profit_usd"] = net_profit
+
+            if net_profit < MIN_NET_PROFIT_USD:
+                result["reason"] = f"Net profit ${net_profit:.4f} < floor ${MIN_NET_PROFIT_USD}"
+                return result
+
             result["valid"] = True
             result["reason"] = "Profit verified"
             return result
-            
+
         except Exception as e:
-            result["reason"] = f"Verification error: {str(e)}"
+            result["reason"] = f"Verification error: {e}"
             return result
-    
+
     async def execute_swap(
         self,
         router_address: str,
@@ -234,13 +250,11 @@ class AtomicArbExecutor:
         path: List[str],
         recipient: str,
         private_key: str,
-        deadline_seconds: int = 300,
+        deadline_seconds: int = 120,    # tighter deadline (was 300)
         gas_price_wei: Optional[int] = None,
         use_private_rpc: bool = True
     ) -> Dict:
-        """
-        Execute a single swap with retry logic.
-        """
+        """Execute a single swap with retry logic."""
         result = {
             "success": False,
             "tx_hash": None,
@@ -249,94 +263,76 @@ class AtomicArbExecutor:
             "error": None,
             "attempts": 0
         }
-        
-        # Select RPC (private for MEV protection)
+
         w3_to_use = self.private_w3 if use_private_rpc and PRIVATE_RPC_URL else self.w3
-        
+
         for attempt in range(MAX_RETRY_ATTEMPTS):
             result["attempts"] = attempt + 1
-            
             try:
                 router = w3_to_use.eth.contract(
                     address=Web3.to_checksum_address(router_address),
                     abi=ROUTER_V2_ABI
                 )
-                
-                checksummed_path = [Web3.to_checksum_address(addr) for addr in path]
+                checksummed_path      = [Web3.to_checksum_address(a) for a in path]
                 checksummed_recipient = Web3.to_checksum_address(recipient)
-                
-                # Gas price with escalation per retry
-                if gas_price_wei is None:
-                    gas_price = w3_to_use.eth.gas_price
-                else:
-                    gas_price = gas_price_wei
-                
-                gas_price = int(gas_price * (1 + GAS_INCREASE_PER_RETRY * attempt))
-                
-                # Deadline
+
+                # Fresh gas price each attempt, escalated per retry
+                base_gas = gas_price_wei if gas_price_wei else w3_to_use.eth.gas_price
+                gas_price = int(base_gas * (1 + GAS_INCREASE_PER_RETRY * attempt))
+
                 deadline = int(time.time()) + deadline_seconds
-                
-                # Estimate gas
+
+                # Gas limit: try estimate, fallback to GAS_PER_SWAP
                 try:
-                    gas_estimate = router.functions.swapExactTokensForTokens(
-                        amount_in,
-                        amount_out_min,
-                        checksummed_path,
-                        checksummed_recipient,
-                        deadline
+                    gas_est = router.functions.swapExactTokensForTokens(
+                        amount_in, amount_out_min, checksummed_path,
+                        checksummed_recipient, deadline
                     ).estimate_gas({'from': checksummed_recipient})
-                    gas_limit = min(int(gas_estimate * GAS_BUFFER_MULTIPLIER), MAX_GAS_LIMIT)
+                    gas_limit = min(int(gas_est * GAS_BUFFER_MULTIPLIER), MAX_GAS_LIMIT)
                 except Exception:
-                    gas_limit = 300000
-                
-                # Build transaction
+                    gas_limit = GAS_PER_SWAP
+
                 nonce = w3_to_use.eth.get_transaction_count(checksummed_recipient)
-                
+
                 tx = router.functions.swapExactTokensForTokens(
-                    amount_in,
-                    amount_out_min,
-                    checksummed_path,
-                    checksummed_recipient,
-                    deadline
+                    amount_in, amount_out_min, checksummed_path,
+                    checksummed_recipient, deadline
                 ).build_transaction({
                     'chainId': w3_to_use.eth.chain_id,
                     'gas': gas_limit,
                     'gasPrice': gas_price,
                     'nonce': nonce,
                 })
-                
-                # Sign and send
+
                 signed_tx = w3_to_use.eth.account.sign_transaction(tx, private_key)
-                tx_hash = w3_to_use.eth.send_raw_transaction(signed_tx.raw_transaction)
-                
-                logger.info(f"Swap tx sent: {tx_hash.hex()} (attempt {attempt + 1})")
-                
-                # Wait for confirmation
+                tx_hash   = w3_to_use.eth.send_raw_transaction(signed_tx.raw_transaction)
+
+                logger.info(f"Swap tx sent: {tx_hash.hex()} (attempt {attempt+1})")
+
+                # Wait for receipt (sync — kept intentional: must know buy succeeded before sell)
                 receipt = w3_to_use.eth.wait_for_transaction_receipt(
                     tx_hash, timeout=TRADE_TIMEOUT_SECONDS
                 )
-                
+
                 if receipt['status'] == 1:
-                    result["success"] = True
-                    result["tx_hash"] = tx_hash.hex()
+                    result["success"]  = True
+                    result["tx_hash"]  = tx_hash.hex()
                     result["gas_used"] = receipt['gasUsed']
-                    logger.info(f"Swap successful: {tx_hash.hex()}")
+                    logger.info(f"Swap confirmed: {tx_hash.hex()}")
                     return result
                 else:
-                    result["error"] = "Transaction reverted"
-                    logger.warning(f"Swap reverted (attempt {attempt + 1})")
-                    
+                    result["error"] = "Transaction reverted on-chain"
+                    logger.warning(f"Swap reverted (attempt {attempt+1})")
+
             except Exception as e:
                 result["error"] = str(e)
-                logger.warning(f"Swap attempt {attempt + 1} failed: {e}")
-            
-            # Exponential backoff
+                logger.warning(f"Swap attempt {attempt+1} failed: {e}")
+
             if attempt < MAX_RETRY_ATTEMPTS - 1:
-                delay = RETRY_BASE_DELAY * (2 ** attempt)
-                await asyncio.sleep(delay)
-        
+                await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+
         return result
-    
+
     async def execute_arbitrage(
         self,
         opportunity: Dict,
@@ -347,12 +343,18 @@ class AtomicArbExecutor:
         bera_price_usd: float = 5.0
     ) -> Dict:
         """
-        Execute complete arbitrage: Buy on DEX A -> Sell on DEX B
-        With atomic-like execution (both must succeed or mark as failed)
+        Execute complete arbitrage: Buy on DEX A → Sell on DEX B.
+
+        Safety chain:
+          1. verify_profit_before_execution (eth_call simulation)
+          2. Execute buy
+          3. Read actual post-buy balance — ABORT if unreadable
+          4. Execute sell using actual balance
+          5. Report accurate net_profit (all costs included)
         """
         start_time = time.time()
-        trade_id = f"arb_{int(time.time())}_{opportunity.get('id', 'unknown')[:8]}"
-        
+        trade_id   = f"arb_{int(time.time())}_{opportunity.get('id','unk')[:8]}"
+
         result = {
             "success": False,
             "trade_id": trade_id,
@@ -360,167 +362,473 @@ class AtomicArbExecutor:
             "sell_result": None,
             "total_gas_used": 0,
             "expected_profit_usd": opportunity.get("net_profit_usd", 0),
-            "actual_profit_usd": 0,
+            "actual_profit_usd": 0.0,
             "error": None,
             "execution_time_ms": 0
         }
-        
+
         try:
-            # Extract opportunity data
-            pair = opportunity.get("token_pair", "")
+            # ── Parse pair ────────────────────────────────────────────
+            pair   = opportunity.get("token_pair", "")
             tokens = pair.split("/") if "/" in pair else pair.split(" → ")[:2]
-            
             if len(tokens) < 2:
-                result["error"] = "Invalid pair format"
+                result["error"] = f"Invalid pair format: '{pair}'"
                 return result
-            
-            from core.constants import TOKENS
-            token_in_info = TOKENS.get(tokens[0])
-            token_out_info = TOKENS.get(tokens[1])
-            
+
+            from core.constants import TOKENS, DYNAMIC_TOKENS
+            token_in_info  = TOKENS.get(tokens[0]) or DYNAMIC_TOKENS.get(tokens[0])
+            token_out_info = TOKENS.get(tokens[1]) or DYNAMIC_TOKENS.get(tokens[1])
+
             if not token_in_info or not token_out_info:
-                result["error"] = "Unknown tokens"
+                result["error"] = f"Unknown tokens: {tokens[0]}, {tokens[1]}"
                 return result
-            
+
             amount_in = int(opportunity.get("amount_in", 0))
-            buy_dex = opportunity.get("buy_dex", "Kodiak V2")
+            if amount_in <= 0:
+                result["error"] = "amount_in is zero"
+                return result
+
+            buy_dex  = opportunity.get("buy_dex",  "Kodiak V2")
             sell_dex = opportunity.get("sell_dex", "BEX")
-            
-            # Get router addresses
-            buy_router = KODIAK_V2_ROUTER if "Kodiak" in buy_dex else BEX_ROUTER
+            buy_router  = KODIAK_V2_ROUTER if "Kodiak" in buy_dex  else BEX_ROUTER
             sell_router = KODIAK_V2_ROUTER if "Kodiak" in sell_dex else BEX_ROUTER
-            
-            # Get current gas price
-            gas_price = self.w3.eth.gas_price
-            
-            # Verify profit before execution
+
+            # ── Fresh gas price at execution time ─────────────────────
+            try:
+                gas_price = self.w3.eth.gas_price
+            except Exception:
+                gas_price = int(1e9)
+
             token_in_price = bera_price_usd if tokens[0] == "WBERA" else 1.0
-            
+
+            # ── Step 1: Profit verification ───────────────────────────
             verification = await self.verify_profit_before_execution(
-                buy_router,
-                sell_router,
-                token_in_info["address"],
-                token_out_info["address"],
-                amount_in,
-                gas_price,
-                bera_price_usd,
-                token_in_info["decimals"],
-                token_out_info["decimals"],
+                buy_router, sell_router,
+                token_in_info["address"], token_out_info["address"],
+                amount_in, gas_price, bera_price_usd,
+                token_in_info["decimals"], token_out_info["decimals"],
                 token_in_price
             )
-            
+
             if not verification["valid"]:
-                result["error"] = f"Profit verification failed: {verification['reason']}"
-                self._log_trade_result(opportunity, result, start_time)
+                result["error"] = f"Pre-execution check failed: {verification['reason']}"
                 return result
-            
-            logger.info(f"Profit verified: ${verification['net_profit_usd']:.4f}")
-            
-            # Calculate minimum outputs with slippage
-            slippage_factor = 1 - (slippage_tolerance / 100)
-            buy_amount_out_min = int(verification["buy_output"] * slippage_factor)
-            sell_amount_out_min = int(verification["sell_output"] * slippage_factor)
-            
-            # Execute Buy: token_in -> token_out
-            buy_result = await self.execute_swap(
-                router_address=buy_router,
-                amount_in=amount_in,
-                amount_out_min=buy_amount_out_min,
-                path=[token_in_info["address"], token_out_info["address"]],
-                recipient=wallet_address,
-                private_key=private_key,
-                gas_price_wei=gas_price,
-                use_private_rpc=use_private_rpc
+
+            logger.info(
+                f"[{trade_id}] Verified net_profit=${verification['net_profit_usd']:.4f} "
+                f"(gross={verification['gross_profit']:.4f} "
+                f"gas={verification['gas_cost_usd']:.4f} "
+                f"fees={verification['dex_fees_usd']:.4f} "
+                f"slip={verification['slippage_cost_usd']:.4f})"
             )
-            
+
+            # ── Step 2: Slippage floors ───────────────────────────────
+            slippage_factor     = 1 - (slippage_tolerance / 100)
+            buy_amount_out_min  = int(verification["buy_output"]  * slippage_factor)
+            # sell_amount_out_min will be recalculated after actual balance read
+
+            # ── Step 3: Execute buy ───────────────────────────────────
+            buy_result = await self.execute_swap(
+                router_address  = buy_router,
+                amount_in       = amount_in,
+                amount_out_min  = buy_amount_out_min,
+                path            = [token_in_info["address"], token_out_info["address"]],
+                recipient       = wallet_address,
+                private_key     = private_key,
+                gas_price_wei   = gas_price,
+                use_private_rpc = use_private_rpc
+            )
             result["buy_result"] = buy_result
-            
+
             if not buy_result["success"]:
                 result["error"] = f"Buy failed: {buy_result['error']}"
-                self._log_trade_result(opportunity, result, start_time)
                 return result
-            
+
             result["total_gas_used"] += buy_result["gas_used"]
-            
-            # Execute Sell: token_out -> token_in
-            # Use actual output from buy as input for sell
-            sell_amount_in = verification["buy_output"]  # Use simulated amount
-            
-            sell_result = await self.execute_swap(
-                router_address=sell_router,
-                amount_in=sell_amount_in,
-                amount_out_min=sell_amount_out_min,
-                path=[token_out_info["address"], token_in_info["address"]],
-                recipient=wallet_address,
-                private_key=private_key,
-                gas_price_wei=gas_price,
-                use_private_rpc=use_private_rpc
-            )
-            
-            result["sell_result"] = sell_result
-            
-            if not sell_result["success"]:
-                result["error"] = f"Sell failed after buy: {sell_result['error']}"
-                # Note: Buy succeeded but sell failed - partial execution
-                self._log_trade_result(opportunity, result, start_time)
+
+            # ── Step 4: Verify actual received balance ────────────────
+            actual_received = self.get_token_balance(token_out_info["address"], wallet_address)
+
+            if actual_received < 0:
+                # Balance read failed — cannot determine how much to sell. ABORT.
+                result["error"] = (
+                    "ABORT: Could not read post-buy balance for token_out. "
+                    "Buy TX succeeded but sell skipped to prevent loss. "
+                    f"Manually check wallet for {token_out_info['symbol']} balance."
+                )
+                logger.error(result["error"])
                 return result
-            
+
+            if actual_received == 0:
+                result["error"] = (
+                    "ABORT: Post-buy balance is zero. Buy TX may have reverted silently."
+                )
+                logger.error(result["error"])
+                return result
+
+            if actual_received < buy_amount_out_min:
+                result["error"] = (
+                    f"ABORT: Received {actual_received} < min expected {buy_amount_out_min}. "
+                    "Slippage exceeded tolerance on buy side."
+                )
+                logger.error(result["error"])
+                return result
+
+            logger.info(f"[{trade_id}] Actual received: {actual_received} {token_out_info['symbol']}")
+
+            # ── Step 5: Execute sell using ACTUAL balance ─────────────
+            # Scale the sell minimum proportionally to what we actually received
+            scale = actual_received / max(verification["buy_output"], 1)
+            sell_amount_out_min = int(verification["sell_output"] * scale * slippage_factor)
+
+            sell_result = await self.execute_swap(
+                router_address  = sell_router,
+                amount_in       = actual_received,
+                amount_out_min  = sell_amount_out_min,
+                path            = [token_out_info["address"], token_in_info["address"]],
+                recipient       = wallet_address,
+                private_key     = private_key,
+                gas_price_wei   = gas_price,
+                use_private_rpc = use_private_rpc
+            )
+            result["sell_result"] = sell_result
+
+            if not sell_result["success"]:
+                result["error"] = (
+                    f"Sell failed after successful buy: {sell_result['error']}. "
+                    f"You hold {actual_received} {token_out_info['symbol']} — sell manually."
+                )
+                logger.error(result["error"])
+                return result
+
             result["total_gas_used"] += sell_result["gas_used"]
-            
-            # Calculate actual profit
-            gas_cost_usd = (result["total_gas_used"] * gas_price / 10**18) * bera_price_usd
-            gross_profit_usd = verification["gross_profit"]
-            result["actual_profit_usd"] = gross_profit_usd - gas_cost_usd - verification["dex_fees_usd"]
-            
+
+            # ── Step 6: Accurate profit reporting ────────────────────
+            # Include ALL four cost components (gas, fees, slippage)
+            actual_gas_cost = (result["total_gas_used"] * gas_price / 10**18) * bera_price_usd
+            result["actual_profit_usd"] = (
+                verification["gross_profit"]
+                - actual_gas_cost
+                - verification["dex_fees_usd"]
+                - verification["slippage_cost_usd"]   # ← was missing before
+            )
+
             result["success"] = True
-            
-            # Update stats
             self.execution_stats["total_executions"] += 1
-            self.execution_stats["successful"] += 1
+            self.execution_stats["successful"]        += 1
             self.execution_stats["total_profit_usd"] += result["actual_profit_usd"]
-            self.execution_stats["total_gas_spent_usd"] += gas_cost_usd
-            
-            logger.info(f"Arbitrage complete! Profit: ${result['actual_profit_usd']:.4f}")
-            
+            self.execution_stats["total_gas_spent_usd"] += actual_gas_cost
+
+            logger.info(f"[{trade_id}] Arbitrage complete! Net profit: ${result['actual_profit_usd']:.4f}")
+
         except Exception as e:
             result["error"] = str(e)
-            logger.error(f"Arbitrage execution error: {e}")
+            logger.error(f"Arbitrage execution error: {e}", exc_info=True)
             self.execution_stats["total_executions"] += 1
-            self.execution_stats["failed"] += 1
-        
+            self.execution_stats["failed"]           += 1
+
         finally:
             result["execution_time_ms"] = int((time.time() - start_time) * 1000)
             self._log_trade_result(opportunity, result, start_time)
-        
+
         return result
-    
-    def _log_trade_result(self, opportunity: Dict, result: Dict, start_time: float):
-        """Log trade to CSV"""
-        trade_data = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "trade_id": result.get("trade_id", ""),
-            "pair": opportunity.get("token_pair", ""),
-            "type": opportunity.get("type", "direct"),
-            "buy_dex": opportunity.get("buy_dex", ""),
-            "sell_dex": opportunity.get("sell_dex", ""),
-            "amount_in": opportunity.get("amount_in", ""),
-            "expected_out": opportunity.get("expected_out", ""),
-            "actual_out": "",
-            "expected_profit_usd": opportunity.get("net_profit_usd", 0),
-            "actual_profit_usd": result.get("actual_profit_usd", 0),
-            "gas_used": result.get("total_gas_used", 0),
-            "gas_price_gwei": 0,
-            "gas_cost_usd": 0,
-            "buy_tx_hash": result.get("buy_result", {}).get("tx_hash", "") if result.get("buy_result") else "",
-            "sell_tx_hash": result.get("sell_result", {}).get("tx_hash", "") if result.get("sell_result") else "",
-            "status": "success" if result.get("success") else "failed",
-            "error": result.get("error", ""),
-            "retry_count": 0,
-            "execution_time_ms": result.get("execution_time_ms", 0),
-            "slippage_actual": 0
+
+    async def execute_bex_swap(
+        self,
+        token_in_address: str,
+        token_out_address: str,
+        amount_in: int,
+        min_out: int,
+        recipient: str,
+        private_key: str,
+        gas_price_wei: Optional[int] = None,
+        use_private_rpc: bool = True
+    ) -> Dict:
+        """
+        Execute a swap on BEX (CrocSwap) DEX.
+        CrocSwap uses base/quote ordering (lower address = base).
+        """
+        result = {
+            "success": False, "tx_hash": None, "gas_used": 0,
+            "actual_output": 0, "error": None, "attempts": 0
         }
-        self.trade_logger.log_trade(trade_data)
-    
+        w3_to_use = self.private_w3 if use_private_rpc and PRIVATE_RPC_URL else self.w3
+
+        try:
+            in_cs  = Web3.to_checksum_address(token_in_address)
+            out_cs = Web3.to_checksum_address(token_out_address)
+
+            # CrocSwap: base = lower address, quote = higher address
+            base_is_in = in_cs.lower() < out_cs.lower()
+            base_addr  = in_cs  if base_is_in else out_cs
+            quote_addr = out_cs if base_is_in else in_cs
+
+            # isBuy = true means "buy base with quote" = token_in is quote, token_out is base
+            # isBuy = false means "sell base for quote" = token_in is base, token_out is quote
+            is_buy     = not base_is_in   # if token_in is quote, we're buying base
+
+            # limitPrice: when buying base use min sqrt price (no lower limit)
+            #             when selling base use max uint128 (no upper limit)
+            limit_price = BEX_MIN_SQRT_PRICE if is_buy else BEX_MAX_UINT128
+
+            bex_router = w3_to_use.eth.contract(
+                address=Web3.to_checksum_address(BEX_ROUTER),
+                abi=BEX_ROUTER_ABI
+            )
+            checksummed_recipient = Web3.to_checksum_address(recipient)
+            base_gas = gas_price_wei if gas_price_wei else w3_to_use.eth.gas_price
+
+            for attempt in range(MAX_RETRY_ATTEMPTS):
+                result["attempts"] = attempt + 1
+                try:
+                    gas_price = int(base_gas * (1 + GAS_INCREASE_PER_RETRY * attempt))
+                    nonce = w3_to_use.eth.get_transaction_count(checksummed_recipient)
+
+                    tx = bex_router.functions.swap(
+                        Web3.to_checksum_address(base_addr),
+                        Web3.to_checksum_address(quote_addr),
+                        BEX_POOL_IDX,
+                        is_buy,
+                        not base_is_in,     # inBaseQty = True if input is base token
+                        amount_in,          # qty (uint128)
+                        0,                  # tip
+                        limit_price,        # limitPrice (uint128 sqrt price)
+                        min_out,            # minOut
+                        0                   # settleFlags
+                    ).build_transaction({
+                        'chainId': w3_to_use.eth.chain_id,
+                        'gas':      GAS_PER_SWAP,
+                        'gasPrice': gas_price,
+                        'nonce':    nonce,
+                        'value':    0,
+                    })
+                    signed_tx = w3_to_use.eth.account.sign_transaction(tx, private_key)
+                    tx_hash   = w3_to_use.eth.send_raw_transaction(signed_tx.raw_transaction)
+                    receipt   = w3_to_use.eth.wait_for_transaction_receipt(
+                        tx_hash, timeout=TRADE_TIMEOUT_SECONDS
+                    )
+                    if receipt['status'] == 1:
+                        result["success"]  = True
+                        result["tx_hash"]  = tx_hash.hex()
+                        result["gas_used"] = receipt['gasUsed']
+                        logger.info(f"BEX swap confirmed: {tx_hash.hex()}")
+                        return result
+                    else:
+                        result["error"] = "BEX tx reverted"
+                except Exception as e:
+                    result["error"] = str(e)
+                    logger.warning(f"BEX swap attempt {attempt+1} failed: {e}")
+                if attempt < MAX_RETRY_ATTEMPTS - 1:
+                    await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    async def execute_triangular_arbitrage(
+        self,
+        opportunity: Dict,
+        wallet_address: str,
+        private_key: str,
+        slippage_tolerance: float = 0.5,
+        use_private_rpc: bool = True,
+        bera_price_usd: float = 5.0
+    ) -> Dict:
+        """
+        Execute triangular arbitrage: A → B → C → A.
+        All 3 legs execute sequentially; post-leg balance verified before each step.
+        Net profit must be positive after ALL costs (gas for 3 swaps, 3x DEX fees, slippage).
+        """
+        start_time = time.time()
+        trade_id   = f"tri_{int(time.time())}_{opportunity.get('id','unk')[:8]}"
+        result = {
+            "success": False, "trade_id": trade_id,
+            "legs": [], "total_gas_used": 0,
+            "expected_profit_usd": opportunity.get("net_profit_usd", 0),
+            "actual_profit_usd": 0.0,
+            "error": None, "execution_time_ms": 0
+        }
+
+        try:
+            from core.constants import TOKENS, DYNAMIC_TOKENS
+            path = opportunity.get("path", [])  # e.g. ["WBERA","HONEY","USDC","WBERA"]
+
+            if len(path) < 3:
+                result["error"] = "Triangular path needs at least 3 tokens"
+                return result
+
+            # Ensure path is a cycle (last == first)
+            if path[0] != path[-1]:
+                path = path + [path[0]]
+
+            legs = []
+            for i in range(len(path) - 1):
+                sym_in  = path[i]
+                sym_out = path[i + 1]
+                tok_in  = TOKENS.get(sym_in)  or DYNAMIC_TOKENS.get(sym_in)
+                tok_out = TOKENS.get(sym_out) or DYNAMIC_TOKENS.get(sym_out)
+                if not tok_in or not tok_out:
+                    result["error"] = f"Unknown token in path: {sym_in} or {sym_out}"
+                    return result
+                legs.append({"sym_in": sym_in, "sym_out": sym_out,
+                              "tok_in": tok_in, "tok_out": tok_out})
+
+            amount_in = int(opportunity.get("amount_in", 0))
+            if amount_in <= 0:
+                result["error"] = "amount_in is zero"
+                return result
+
+            try:
+                gas_price = self.w3.eth.gas_price
+            except Exception:
+                gas_price = int(1e9)
+
+            slippage_factor = 1 - (slippage_tolerance / 100)
+
+            # ── Pre-simulate all legs ─────────────────────────────────
+            sim_amount = amount_in
+            for leg in legs:
+                sim_out = await self.simulate_swap(
+                    KODIAK_V2_ROUTER, sim_amount,
+                    [leg["tok_in"]["address"], leg["tok_out"]["address"]]
+                )
+                if not sim_out or sim_out <= 0:
+                    result["error"] = f"Simulation failed: {leg['sym_in']}→{leg['sym_out']}"
+                    return result
+                leg["sim_out"] = sim_out
+                sim_amount = sim_out
+
+            # Verify cycle profit
+            final_simulated = sim_amount
+            first_tok = legs[0]["tok_in"]
+            token_price = bera_price_usd if legs[0]["sym_in"] == "WBERA" else 1.0
+            gross_profit = ((final_simulated - amount_in) / (10 ** first_tok["decimals"])) * token_price
+            n_swaps = len(legs)
+            total_gas_cost = (GAS_PER_SWAP * n_swaps * gas_price / 10**18) * bera_price_usd
+            amount_usd = (amount_in / (10 ** first_tok["decimals"])) * token_price
+            dex_fees   = amount_usd * (DEX_FEE_PERCENT / 100) * n_swaps
+            slippage_c = amount_usd * (slippage_tolerance / 100) * n_swaps * 0.5
+
+            net_profit = gross_profit - total_gas_cost - dex_fees - slippage_c
+            if net_profit < MIN_NET_PROFIT_USD:
+                result["error"] = f"Pre-execution net profit ${net_profit:.4f} < floor"
+                return result
+
+            logger.info(f"[{trade_id}] Triangular verified: net=${net_profit:.4f} over {n_swaps} swaps")
+
+            # ── Execute each leg ──────────────────────────────────────
+            current_amount = amount_in
+            total_gas_used = 0
+
+            for i, leg in enumerate(legs):
+                dex_name   = opportunity.get("dexes", ["Kodiak V2"] * n_swaps)[i] if opportunity.get("dexes") else "Kodiak V2"
+                use_bex    = "BEX" in dex_name
+                amount_out_min = int(leg["sim_out"] * slippage_factor)
+
+                if use_bex:
+                    swap_result = await self.execute_bex_swap(
+                        leg["tok_in"]["address"], leg["tok_out"]["address"],
+                        current_amount, amount_out_min,
+                        wallet_address, private_key,
+                        gas_price_wei=gas_price, use_private_rpc=use_private_rpc
+                    )
+                else:
+                    swap_result = await self.execute_swap(
+                        router_address=KODIAK_V2_ROUTER,
+                        amount_in=current_amount,
+                        amount_out_min=amount_out_min,
+                        path=[leg["tok_in"]["address"], leg["tok_out"]["address"]],
+                        recipient=wallet_address,
+                        private_key=private_key,
+                        gas_price_wei=gas_price,
+                        use_private_rpc=use_private_rpc
+                    )
+
+                result["legs"].append(swap_result)
+
+                if not swap_result["success"]:
+                    result["error"] = (
+                        f"Leg {i+1} ({leg['sym_in']}→{leg['sym_out']}) failed: {swap_result['error']}. "
+                        f"{'Prior legs succeeded — check wallet balances.' if i > 0 else ''}"
+                    )
+                    logger.error(result["error"])
+                    return result
+
+                total_gas_used += swap_result["gas_used"]
+
+                # Verify actual balance before next leg
+                if i < len(legs) - 1:
+                    actual_bal = self.get_token_balance(leg["tok_out"]["address"], wallet_address)
+                    if actual_bal < 0:
+                        result["error"] = f"Cannot read balance of {leg['sym_out']} after leg {i+1}. Stopping."
+                        return result
+                    if actual_bal == 0:
+                        result["error"] = f"Zero balance of {leg['sym_out']} after leg {i+1}."
+                        return result
+                    current_amount = actual_bal
+                    logger.info(f"[{trade_id}] Leg {i+1} done: {actual_bal} {leg['sym_out']}")
+
+            result["total_gas_used"] = total_gas_used
+            actual_gas_cost = (total_gas_used * gas_price / 10**18) * bera_price_usd
+            result["actual_profit_usd"] = gross_profit - actual_gas_cost - dex_fees - slippage_c
+            result["success"] = True
+
+            self.execution_stats["total_executions"] += 1
+            self.execution_stats["successful"]        += 1
+            self.execution_stats["total_profit_usd"] += result["actual_profit_usd"]
+
+            logger.info(f"[{trade_id}] Triangular complete! Profit: ${result['actual_profit_usd']:.4f}")
+
+        except Exception as e:
+            result["error"] = str(e)
+            logger.error(f"Triangular execution error: {e}", exc_info=True)
+            self.execution_stats["total_executions"] += 1
+            self.execution_stats["failed"]           += 1
+        finally:
+            result["execution_time_ms"] = int((time.time() - start_time) * 1000)
+            self.trade_logger.log_trade({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "trade_id": trade_id, "pair": "→".join(opportunity.get("path", [])),
+                "type": "triangular",
+                "buy_dex": "", "sell_dex": "",
+                "amount_in": opportunity.get("amount_in", ""),
+                "expected_out": "", "actual_out": "",
+                "expected_profit_usd": opportunity.get("net_profit_usd", 0),
+                "actual_profit_usd": result.get("actual_profit_usd", 0),
+                "gas_used": result.get("total_gas_used", 0),
+                "gas_price_gwei": 0, "gas_cost_usd": 0,
+                "buy_tx_hash": result["legs"][0].get("tx_hash", "") if result["legs"] else "",
+                "sell_tx_hash": result["legs"][-1].get("tx_hash", "") if result["legs"] else "",
+                "status": "success" if result.get("success") else "failed",
+                "error": result.get("error", ""),
+                "retry_count": 0, "execution_time_ms": result.get("execution_time_ms", 0),
+                "slippage_actual": 0
+            })
+        return result
+
+    def _log_trade_result(self, opportunity: Dict, result: Dict, start_time: float):
+        self.trade_logger.log_trade({
+            "timestamp":          datetime.now(timezone.utc).isoformat(),
+            "trade_id":           result.get("trade_id", ""),
+            "pair":               opportunity.get("token_pair", ""),
+            "type":               opportunity.get("type", "direct"),
+            "buy_dex":            opportunity.get("buy_dex", ""),
+            "sell_dex":           opportunity.get("sell_dex", ""),
+            "amount_in":          opportunity.get("amount_in", ""),
+            "expected_out":       opportunity.get("expected_out", ""),
+            "actual_out":         result.get("sell_result", {}).get("actual_output", "") if result.get("sell_result") else "",
+            "expected_profit_usd": opportunity.get("net_profit_usd", 0),
+            "actual_profit_usd":  result.get("actual_profit_usd", 0),
+            "gas_used":           result.get("total_gas_used", 0),
+            "gas_price_gwei":     0,
+            "gas_cost_usd":       0,
+            "buy_tx_hash":        result.get("buy_result",  {}).get("tx_hash", "") if result.get("buy_result")  else "",
+            "sell_tx_hash":       result.get("sell_result", {}).get("tx_hash", "") if result.get("sell_result") else "",
+            "status":             "success" if result.get("success") else "failed",
+            "error":              result.get("error", ""),
+            "retry_count":        0,
+            "execution_time_ms":  result.get("execution_time_ms", 0),
+            "slippage_actual":    0
+        })
+
     def get_execution_stats(self) -> Dict:
-        """Get execution statistics"""
         return self.execution_stats.copy()

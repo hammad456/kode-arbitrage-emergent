@@ -34,21 +34,67 @@ from execution.atomic_executor import AtomicArbExecutor, TradeLogger
 from execution.flash_loan import FlashLoanExecutor
 from scanner.multicall_scanner import RealPriceScanner
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# MongoDB connection - fallback to mongomock if real MongoDB unavailable
+mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
+db_name = os.environ.get('DB_NAME', 'bearb_db')
+try:
+    client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=3000)
+    db = client[db_name]
+    logging.info(f"MongoDB connecting to: {mongo_url}")
+except Exception as _mongo_err:
+    logging.warning(f"MongoDB unavailable ({_mongo_err}), using in-memory mock")
+    try:
+        from mongomock_motor import AsyncMongoMockClient
+        client = AsyncMongoMockClient()
+        db = client[db_name]
+        logging.info("Using mongomock-motor in-memory database")
+    except ImportError:
+        logging.error("mongomock-motor not installed; DB operations will fail")
+        client = AsyncIOMotorClient(mongo_url)
+        db = client[db_name]
 
-# Berachain Configuration
-BERACHAIN_RPC = os.environ.get('BERACHAIN_RPC', 'https://rpc.berachain.com')
+# ─── Berachain RPC — multi-endpoint with local node priority ────────────────
+# Priority: LOCAL_NODE_RPC → BERACHAIN_RPC → public fallbacks
+_LOCAL_NODE_RPC = os.environ.get('LOCAL_NODE_RPC', '')        # e.g. http://localhost:8545
+_PUBLIC_RPC     = os.environ.get('BERACHAIN_RPC', 'https://rpc.berachain.com')
+# Comma-separated fallback RPCs (tried in order if primary fails)
+_FALLBACK_RPCS  = [r.strip() for r in os.environ.get('FALLBACK_RPCS', '').split(',') if r.strip()]
+BERACHAIN_RPC   = _LOCAL_NODE_RPC if _LOCAL_NODE_RPC else _PUBLIC_RPC
 CHAIN_ID = 80094
 
-# Initialize Web3
-w3 = Web3(Web3.HTTPProvider(BERACHAIN_RPC))
 
-# Initialize Private RPC for MEV Protection (if configured)
+def _make_w3(rpc_url: str) -> Web3:
+    """Create a Web3 instance and verify connectivity."""
+    w3_candidate = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 10}))
+    try:
+        if w3_candidate.is_connected():
+            logger.info(f"RPC connected: {rpc_url}")
+            return w3_candidate
+    except Exception:
+        pass
+    logger.warning(f"RPC NOT connected: {rpc_url}")
+    return w3_candidate
+
+
+def _best_w3() -> Web3:
+    """Try RPCs in priority order; return first that connects."""
+    candidates = [BERACHAIN_RPC] + _FALLBACK_RPCS
+    for url in candidates:
+        if not url:
+            continue
+        candidate = _make_w3(url)
+        if candidate.is_connected():
+            return candidate
+    # Return primary even if offline (will fail at call time with clear error)
+    return _make_w3(BERACHAIN_RPC)
+
+
+# Initialize Web3 with best available RPC
+w3 = _best_w3()
+
+# Private RPC for MEV protection (Flashbots-style private submission)
 private_rpc_url = os.environ.get('PRIVATE_RPC_URL', '')
-private_w3 = Web3(Web3.HTTPProvider(private_rpc_url)) if private_rpc_url else None
+private_w3 = _make_w3(private_rpc_url) if private_rpc_url else None
 
 # Initialize Production Execution Components
 token_approval_manager = TokenApprovalManager(w3)
@@ -58,16 +104,23 @@ real_price_scanner = RealPriceScanner(w3)
 trade_logger = TradeLogger()
 
 # Production Mode Flag
-PRODUCTION_MODE = os.environ.get('PRODUCTION_MODE', 'false').lower() == 'true'
-USE_PRIVATE_RPC = os.environ.get('USE_PRIVATE_RPC', 'true').lower() == 'true'
+PRODUCTION_MODE  = os.environ.get('PRODUCTION_MODE', 'false').lower() == 'true'
+USE_PRIVATE_RPC  = os.environ.get('USE_PRIVATE_RPC', 'false').lower() == 'true'
+USING_LOCAL_NODE = bool(_LOCAL_NODE_RPC and w3.provider.endpoint_uri == _LOCAL_NODE_RPC)  # type: ignore
 
-# Safety limits - Production ready (Micro-Arbitrage Optimized)
-MAX_TRADE_SIZE_USD = 10000
-MAX_GAS_LIMIT = 500000
+logger.info(
+    f"RPC mode: {'LOCAL NODE' if USING_LOCAL_NODE else 'PUBLIC RPC'} → {BERACHAIN_RPC} | "
+    f"MEV protection: {'ON' if USE_PRIVATE_RPC and private_rpc_url else 'OFF'}"
+)
+
+# ─── Safety limits (imported from core.constants — single source of truth) ──
+from core.constants import (
+    MIN_PROFIT_THRESHOLD, MIN_SPREAD_THRESHOLD, MAX_SLIPPAGE_PERCENT,
+    MAX_PRICE_IMPACT_PERCENT, MIN_LIQUIDITY_USD
+)
+MAX_TRADE_SIZE_USD    = 10000
+MAX_GAS_LIMIT         = 500000
 TRADE_TIMEOUT_SECONDS = 120
-MIN_PROFIT_THRESHOLD = 0.0005  # $0.0005 minimum for micro-arb
-MIN_SPREAD_THRESHOLD = 0.05   # 0.05% spread threshold (micro-arbitrage)
-MAX_SLIPPAGE_PERCENT = 5.0
 PRICE_CHANGE_TOLERANCE = 2.0
 GAS_BUFFER_MULTIPLIER = 1.3
 MAX_PRICE_IMPACT_PERCENT = 3.0
@@ -94,15 +147,20 @@ BEX_QUERY = "0x8685CE9Db06D40CBa73e3d09e6868FE476B5dC89"
 HONEYPOT_ROUTER = "0x1306D3c36eC7E38dd2c128fBe3097C2C2449af64"
 WBERA = "0x6969696969696969696969696969696969696969"
 
-# Common tokens on Berachain
-TOKENS = {
-    "WBERA": {"address": "0x6969696969696969696969696969696969696969", "decimals": 18, "symbol": "WBERA"},
-    "HONEY": {"address": "0xFCBD14DC51f0A4d49d5E53C2E0950e0bC26d0Dce", "decimals": 18, "symbol": "HONEY"},
-    "USDC": {"address": "0x549943e04f40284185054145c6E4e9568C1D3241", "decimals": 6, "symbol": "USDC"},
-    "USDT": {"address": "0x779Ded0c9e1022225f8E0630b35a9b54bE713736", "decimals": 6, "symbol": "USDT"},
-    "WETH": {"address": "0x2F6F07CDcf3588944Bf4C42aC74ff24bF56e7590", "decimals": 18, "symbol": "WETH"},
-    "WBTC": {"address": "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c", "decimals": 8, "symbol": "WBTC"},
-}
+# Common tokens on Berachain — imported from core.constants for consistency
+from core.constants import (
+    TOKENS as _CORE_TOKENS,
+    STABLE_ADDRESSES,
+    TOKEN_BY_ADDRESS,
+    DYNAMIC_TOKENS,
+    BEX_POOL_IDX,
+    BEX_MIN_SQRT_PRICE,
+    BEX_MAX_UINT128,
+)
+import math as _math
+import itertools as _itertools
+
+TOKENS: Dict[str, Dict] = dict(_CORE_TOKENS)  # mutable copy; dynamically extended at runtime
 
 # Uniswap V2 Router ABI (for Kodiak V2)
 ROUTER_V2_ABI = json.loads('''[
@@ -139,6 +197,17 @@ PAIR_ABI = json.loads('''[
 FACTORY_ABI = json.loads('''[
     {"constant":true,"inputs":[{"name":"tokenA","type":"address"},{"name":"tokenB","type":"address"}],"name":"getPair","outputs":[{"name":"pair","type":"address"}],"type":"function"}
 ]''')
+
+# BEX CrocSwap Query ABI
+BEX_QUERY_ABI = json.loads('''[
+    {"inputs":[{"internalType":"address","name":"base","type":"address"},{"internalType":"address","name":"quote","type":"address"},{"internalType":"uint256","name":"poolIdx","type":"uint256"}],"name":"queryPrice","outputs":[{"internalType":"uint128","name":"","type":"uint128"}],"stateMutability":"view","type":"function"},
+    {"inputs":[{"internalType":"address","name":"base","type":"address"},{"internalType":"address","name":"quote","type":"address"},{"internalType":"uint256","name":"poolIdx","type":"uint256"},{"internalType":"bool","name":"isBuy","type":"bool"},{"internalType":"bool","name":"inBaseQty","type":"bool"},{"internalType":"uint128","name":"qty","type":"uint128"},{"internalType":"uint16","name":"tip","type":"uint16"},{"internalType":"uint128","name":"limitPrice","type":"uint128"},{"internalType":"uint128","name":"minOut","type":"uint128"},{"internalType":"uint8","name":"reserveFlags","type":"uint8"}],"name":"previewSwap","outputs":[{"internalType":"int128","name":"baseFlow","type":"int128"},{"internalType":"int128","name":"quoteFlow","type":"int128"}],"stateMutability":"view","type":"function"}
+]''')
+
+# BEX CrocSwap constants
+BEX_POOL_IDX = 36000
+BEX_MIN_SQRT_PRICE = 65536
+BEX_MAX_UINT128 = (2**128) - 1
 
 app = FastAPI(title="Berachain Arbitrage Bot")
 api_router = APIRouter(prefix="/api")
@@ -1148,6 +1217,60 @@ async def get_dex_quote_fast(router_address: str, token_in: str, token_out: str,
         logger.debug(f"DEX quote error ({dex_name}): {e}")
     return None
 
+async def get_bex_quote_fast(token_in: str, token_out: str, amount_in: int) -> Optional[PriceQuote]:
+    """Get price quote from BEX (CrocSwap) using previewSwap - proper interface"""
+    try:
+        bex_query_contract = w3.eth.contract(
+            address=Web3.to_checksum_address(BEX_QUERY),
+            abi=BEX_QUERY_ABI
+        )
+        token_in_cs = Web3.to_checksum_address(token_in)
+        token_out_cs = Web3.to_checksum_address(token_out)
+
+        # CrocSwap: base is the lower address token
+        if int(token_in_cs, 16) < int(token_out_cs, 16):
+            base, quote_addr = token_in_cs, token_out_cs
+            is_buy = False      # Selling base
+            in_base_qty = True
+            limit_price = BEX_MIN_SQRT_PRICE
+        else:
+            base, quote_addr = token_out_cs, token_in_cs
+            is_buy = True       # Buying base with quote
+            in_base_qty = False
+            limit_price = BEX_MAX_UINT128
+
+        base_flow, quote_flow = bex_query_contract.functions.previewSwap(
+            base, quote_addr, BEX_POOL_IDX,
+            is_buy, in_base_qty, amount_in,
+            0, limit_price, 0, 0
+        ).call()
+
+        # We receive the token with negative flow (outflow from pool)
+        amount_out = abs(base_flow) if is_buy else abs(quote_flow)
+        if not (is_buy and base_flow < 0) and not (not is_buy and quote_flow < 0):
+            return None
+
+        token_in_info = next((t for t in TOKENS.values() if t["address"].lower() == token_in.lower()), None)
+        token_out_info = next((t for t in TOKENS.values() if t["address"].lower() == token_out.lower()), None)
+
+        if token_in_info and token_out_info:
+            amount_in_decimal = amount_in / (10 ** token_in_info["decimals"])
+            amount_out_decimal = amount_out / (10 ** token_out_info["decimals"])
+            price = amount_out_decimal / amount_in_decimal if amount_in_decimal > 0 else 0
+            return PriceQuote(
+                dex="BEX",
+                token_in=token_in_info["symbol"],
+                token_out=token_out_info["symbol"],
+                amount_in=str(amount_in),
+                amount_out=str(amount_out),
+                price=price,
+                price_impact=min(0.1 + (amount_in_decimal * 0.001), 5.0),
+                gas_estimate=180000
+            )
+    except Exception as e:
+        logger.debug(f"BEX quote error: {e}")
+    return None
+
 async def get_multicall_quotes(pairs: List[tuple], amount_in_map: Dict[str, int]) -> Dict[str, PriceQuote]:
     """Fetch multiple quotes using multicall for speed"""
     results = {}
@@ -1171,34 +1294,66 @@ async def get_multicall_quotes(pairs: List[tuple], amount_in_map: Dict[str, int]
     
     return results
 
+def _calc_v2_output(amount_in: int, reserve_in: int, reserve_out: int, fee: int = 997) -> int:
+    """Uniswap V2 constant-product output (no RPC)."""
+    if amount_in <= 0 or reserve_in <= 0 or reserve_out <= 0:
+        return 0
+    num = fee * amount_in * reserve_out
+    den = 1000 * reserve_in + fee * amount_in
+    return num // den if den > 0 else 0
+
+
+def _calc_optimal_trade_size(r_in_buy: int, r_out_buy: int, r_out_sell: int, r_in_sell: int,
+                              fee: int = 997, max_fraction: float = 0.20) -> int:
+    """
+    Closed-form optimal flash-loan size for two V2 AMMs.
+    optimal = (f*sqrt(a*b*c*d) - a*c) / (f*(b+c))
+    where f=fee/1000, a=r_in_buy, b=r_out_buy, c=r_out_sell, d=r_in_sell.
+    """
+    try:
+        a, b, c, d = r_in_buy, r_out_buy, r_out_sell, r_in_sell
+        if min(a, b, c, d) <= 0:
+            return 0
+        f = fee / 1000.0
+        num = f * _math.sqrt(a * b * c * d) - a * c
+        den = f * (b + c)
+        if den <= 0 or num <= 0:
+            return 0
+        return min(int(num / den), int(min(a, d) * max_fraction))
+    except Exception:
+        return 0
+
+
+def _all_token_pairs() -> List[tuple]:
+    """
+    Generate ALL unique (tokenA, tokenB) combinations from the full token registry,
+    including dynamically discovered tokens.
+    """
+    # Merge static + dynamic tokens into a unified symbol-keyed dict
+    all_tokens: Dict[str, Dict] = dict(TOKENS)
+    for addr, info in DYNAMIC_TOKENS.items():
+        sym = info.get("symbol", addr[:6])
+        if sym not in all_tokens:
+            all_tokens[sym] = info
+    symbols = list(all_tokens.keys())
+    return list(_itertools.combinations(symbols, 2))
+
+
 async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
     """
-    Optimized arbitrage scanning with in-memory price matrix.
-    Detects both direct and triangular arbitrage opportunities.
-    
+    Universal arbitrage scanner — scans ALL token pairs across all 3 DEXes.
     Features:
-    - Focused pair scanning for speed
-    - Direct arbitrage (DEX A vs DEX B)
-    - Triangular arbitrage (A → B → C → A)
+    - Dynamic pair expansion (all TOKENS combinations + discovered tokens)
+    - Optimal flash-loan size (closed-form V2-V2, scaled for mixed DEX)
+    - Direct, triangular, and multi-hop detection
     - Risk-adjusted profit ranking
     """
     start_time = time.time()
     opportunities = []
-    
-    # Core high-liquidity pairs for fast scanning
-    pairs = [
-        ("WBERA", "HONEY"),
-        ("WBERA", "USDC"),
-        ("WBERA", "USDT"),
-        ("WBERA", "WETH"),
-        ("WBERA", "WBTC"),
-        ("HONEY", "USDC"),
-        ("HONEY", "USDT"),
-        ("WETH", "USDC"),
-        ("WBTC", "USDC"),
-        ("USDC", "USDT"),
-    ]
-    
+
+    # All token pairs (static + dynamically discovered tokens)
+    pairs = _all_token_pairs()
+
     # Update cache once
     await cache.update_gas_price()
     gas_price = cache.gas_price
@@ -1275,37 +1430,35 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         if price_impact > MAX_PRICE_IMPACT_PERCENT:
             continue
         
-        # Get REAL quote from second DEX
-        # Note: BEX uses CrocSwap interface - for now use Kodiak V3 for comparison
-        # TODO: Implement CrocSwap query interface for BEX when deployed
+        # Get quotes from both Kodiak V3 and BEX in parallel
+        v3_task = get_dex_quote_fast(
+            KODIAK_V3_ROUTER,
+            token_a_info["address"],
+            token_b_info["address"],
+            amount_in,
+            "Kodiak V3"
+        )
+        bex_task = get_bex_quote_fast(
+            token_a_info["address"],
+            token_b_info["address"],
+            amount_in
+        )
+        v3_result, bex_result = await asyncio.gather(v3_task, bex_task, return_exceptions=True)
+
+        # Collect all valid second-dex quotes and pick best arbitrage
+        second_dex_candidates = []
+        if isinstance(v3_result, PriceQuote):
+            second_dex_candidates.append(v3_result)
+        if isinstance(bex_result, PriceQuote):
+            second_dex_candidates.append(bex_result)
+
         second_dex_quote = None
-        second_dex_name = "Kodiak V3"
-        
-        try:
-            # Try Kodiak V3 first (different router, may have different prices)
-            second_dex_quote = await get_dex_quote_fast(
-                KODIAK_V3_ROUTER,
-                token_a_info["address"],
-                token_b_info["address"],
-                amount_in,
-                "Kodiak V3"
-            )
-        except Exception as v3_err:
-            logger.debug(f"Kodiak V3 quote error: {v3_err}")
-        
-        # If V3 failed, try BEX (CrocSwap interface)
-        if not second_dex_quote:
-            try:
-                second_dex_quote = await get_dex_quote_fast(
-                    BEX_ROUTER,
-                    token_a_info["address"],
-                    token_b_info["address"],
-                    amount_in,
-                    "BEX"
-                )
-                second_dex_name = "BEX"
-            except Exception as bex_err:
-                logger.debug(f"BEX quote error: {bex_err}")
+        best_spread = 0.0
+        for candidate in second_dex_candidates:
+            candidate_spread = abs(quote.price - candidate.price) / max(quote.price, candidate.price, 1e-18) * 100
+            if candidate_spread > best_spread:
+                best_spread = candidate_spread
+                second_dex_quote = candidate
         
         # If no second DEX quote available, skip this pair
         if not second_dex_quote:
@@ -1323,18 +1476,38 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
         if spread > 0.05:
             total_gas = buy_quote.gas_estimate + sell_quote.gas_estimate
             gas_cost_usd = (total_gas * gas_price / 10**18) * bera_price
-            
-            amount_out_buy = int(buy_quote.amount_out)
-            amount_out_sell = int(sell_quote.amount_out)
-            
-            # Calculate profits
-            token_price = bera_price if token_b == "WBERA" else 1.0
+
+            # ── Optimal trade sizing ─────────────────────────────────
+            # Try to scale from the 100-unit probe to the optimal amount
+            pair_cache_key2 = cache.get_pair_key(token_a_info["address"], token_b_info["address"])
+            opt_amount_in = amount_in  # default: probe amount
+            if pair_cache_key2 in cache.pool_reserves:
+                res = cache.pool_reserves[pair_cache_key2]
+                r0 = res.get("reserve_a", 0)
+                r1 = res.get("reserve_b", 0)
+                if r0 and r1:
+                    opt = _calc_optimal_trade_size(r0, r1, r1, r0)
+                    if opt > 0:
+                        opt_amount_in = opt
+
+            scale = opt_amount_in / max(amount_in, 1)
+            amount_out_buy  = int(buy_quote.amount_out  * scale)
+            amount_out_sell = int(sell_quote.amount_out * scale)
+
+            # USD price for token_b
+            if token_b_info["address"].lower() in STABLE_ADDRESSES:
+                token_price = 1.0
+            elif token_b == "WBERA":
+                token_price = bera_price
+            else:
+                token_price = 1.0  # conservative
+
             raw_profit = (amount_out_sell - amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price
             slippage_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * 0.005
             impact_cost = abs(amount_out_buy) / (10 ** token_b_info["decimals"]) * token_price * (price_impact / 100)
-            
+
             net_profit = raw_profit - gas_cost_usd - slippage_cost - impact_cost
-            
+
             if net_profit > MIN_PROFIT_THRESHOLD:
                 opp_data = {
                     "id": str(uuid.uuid4()),
@@ -1348,7 +1521,8 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
                     "potential_profit_usd": raw_profit,
                     "gas_cost_usd": gas_cost_usd,
                     "net_profit_usd": net_profit,
-                    "amount_in": str(amount_in),
+                    "optimal_amount_in": str(opt_amount_in),
+                    "amount_in": str(opt_amount_in),
                     "expected_out": str(amount_out_sell),
                     "token_in_address": token_a_info["address"],
                     "token_out_address": token_b_info["address"],
@@ -1362,11 +1536,25 @@ async def find_arbitrage_opportunities_fast() -> List[ArbitrageOpportunity]:
             else:
                 arb_logger.log_skip(pair_key, f"net_profit ${net_profit:.4f} < threshold")
     
-    # Lightweight triangular detection using cached prices
-    # Only check if we have enough price data in matrix
+    # Triangular detection — search from every known token as pivot
     if len(price_matrix.prices) >= 4:
-        tri_paths = price_matrix.find_triangular_paths("WBERA")
-        for path in tri_paths[:5]:  # Check top 5 paths only
+        tri_paths = []
+        for pivot in list(TOKENS.keys()) + list(DYNAMIC_TOKENS.keys()):
+            sym = pivot if isinstance(pivot, str) else pivot.get("symbol", "")
+            if not sym:
+                continue
+            for p in price_matrix.find_triangular_paths(sym)[:3]:
+                tri_paths.append(p)
+        # Deduplicate by frozen path key
+        seen_tri = set()
+        deduped = []
+        for p in tri_paths:
+            key = tuple(sorted(p))
+            if key not in seen_tri:
+                seen_tri.add(key)
+                deduped.append(p)
+        tri_paths = deduped
+        for path in tri_paths[:20]:  # Check top 20 paths
             try:
                 # Quick profit estimate using cached prices
                 p1 = price_matrix.get_price(path[0], path[1])
@@ -2289,18 +2477,35 @@ async def execute_atomic_arbitrage(request: AtomicExecutionRequest):
                 "opportunities_available": len(opportunities)
             }
         
-        # Get current BERA price
-        bera_price = await get_token_price_coingecko("berachain-bera")
-        
-        # Check and approve tokens if needed
-        tokens = opportunity["token_pair"].split("/")
-        token_in = TOKENS.get(tokens[0])
-        
+        # ── Get fresh prices at execution time ──────────────────────
+        try:
+            bera_price = await get_token_price_coingecko("berachain-bera")
+            if bera_price <= 0:
+                raise ValueError("zero price")
+        except Exception:
+            bera_price = price_cache.get("bera_price", 5.0)
+
+        # ── Staleness check: reject if opportunity is too old ────────
+        opp_ts = opportunity.get("timestamp")
+        MAX_OPP_AGE_SECONDS = 15  # opportunity must be < 15 seconds old
+        if opp_ts:
+            age = time.time() - float(opp_ts)
+            if age > MAX_OPP_AGE_SECONDS:
+                return {
+                    "success": False,
+                    "error": f"Opportunity is {age:.0f}s old (max {MAX_OPP_AGE_SECONDS}s). Re-scan first.",
+                }
+
+        # ── Check and approve tokens ─────────────────────────────────
+        pair_str = opportunity["token_pair"]
+        tokens_split = pair_str.split("/") if "/" in pair_str else pair_str.split(" → ")[:2]
+        token_in_sym = tokens_split[0] if tokens_split else ""
+        token_in = TOKENS.get(token_in_sym) or DYNAMIC_TOKENS.get(token_in_sym)
+
         if token_in:
-            # Determine which router needs approval
-            buy_dex = opportunity.get("buy_dex", "Kodiak V2")
+            buy_dex    = opportunity.get("buy_dex", "Kodiak V2")
             buy_router = KODIAK_V2_ROUTER if "Kodiak" in buy_dex else BEX_ROUTER
-            
+
             approval_result = await token_approval_manager.ensure_approval(
                 token_address=token_in["address"],
                 spender=buy_router,
@@ -2308,14 +2513,14 @@ async def execute_atomic_arbitrage(request: AtomicExecutionRequest):
                 required_amount=int(opportunity["amount_in"]),
                 private_key=request.private_key
             )
-            
+
             if not approval_result["success"]:
                 return {
                     "success": False,
                     "error": f"Token approval failed: {approval_result.get('error')}",
                     "approval_result": approval_result
                 }
-        
+
         # Execute atomic arbitrage
         result = await atomic_executor.execute_arbitrage(
             opportunity=opportunity,
@@ -2488,20 +2693,32 @@ async def scan_real_opportunities():
     Production scan using real on-chain data via Multicall.
     No mock data - all prices fetched from actual DEX contracts.
     """
+    # Fetch gas price with fallback
     try:
-        # Update gas price
         gas_price = w3.eth.gas_price
+    except Exception as e:
+        logger.warning(f"Gas price fetch failed, using fallback: {e}")
+        gas_price = int(1e9)  # 1 gwei fallback
+
+    # Fetch BERA price with fallback
+    try:
         bera_price = await get_token_price_coingecko("berachain-bera")
-        
+        if bera_price <= 0:
+            raise ValueError("Invalid price returned")
+    except Exception as e:
+        logger.warning(f"BERA price fetch failed, using cached fallback: {e}")
+        bera_price = price_cache.get("bera_price", 5.0)
+
+    try:
         # Use real price scanner
         opportunities = await real_price_scanner.scan_arbitrage_opportunities(
             gas_price_wei=gas_price,
             bera_price_usd=bera_price
         )
-        
+
         # Get scanner metrics
         metrics = real_price_scanner.get_scan_metrics()
-        
+
         return {
             "opportunities": opportunities,
             "count": len(opportunities),
@@ -2509,13 +2726,53 @@ async def scan_real_opportunities():
             "gas_price_gwei": gas_price / 10**9,
             "bera_price_usd": bera_price
         }
-        
+
     except Exception as e:
+        logger.error(f"Scan-real error: {e}")
         return {
             "error": str(e),
             "opportunities": [],
-            "count": 0
+            "count": 0,
+            "gas_price_gwei": gas_price / 10**9,
+            "bera_price_usd": bera_price
         }
+
+@api_router.get("/production/scan-all")
+async def scan_all_market_opportunities():
+    """
+    Full market scan: discovers ALL pairs from Kodiak V2 factory and scans
+    every pair across Kodiak V2, Kodiak V3, and BEX.
+    Uses closed-form optimal trade sizing to maximize profit per opportunity.
+    Heavier than /scan-real but finds opportunities across the ENTIRE market.
+    """
+    try:
+        gas_price = w3.eth.gas_price
+    except Exception:
+        gas_price = int(1e9)
+    try:
+        bera_price = await get_token_price_coingecko("berachain-bera")
+        if bera_price <= 0:
+            raise ValueError("zero price")
+    except Exception:
+        bera_price = price_cache.get("bera_price", 5.0)
+
+    try:
+        opps = await real_price_scanner.scan_all_market_pairs(
+            gas_price_wei=gas_price,
+            bera_price_usd=bera_price,
+        )
+        metrics = real_price_scanner.get_scan_metrics()
+        return {
+            "opportunities": opps,
+            "count": len(opps),
+            "scan_metrics": metrics,
+            "gas_price_gwei": gas_price / 1e9,
+            "bera_price_usd": bera_price,
+        }
+    except Exception as e:
+        logger.error(f"scan-all error: {e}")
+        return {"error": str(e), "opportunities": [], "count": 0}
+
 
 @api_router.get("/production/execution-stats")
 async def get_production_execution_stats():
@@ -2546,7 +2803,13 @@ async def websocket_prices(websocket: WebSocket):
     try:
         while True:
             scan_start = time.time()
-            
+
+            # Merge any newly discovered tokens into local TOKENS dict
+            for addr, info in DYNAMIC_TOKENS.items():
+                sym = info.get("symbol", addr[:6])
+                if sym not in TOKENS:
+                    TOKENS[sym] = info
+
             # Fast scan - target < 1 second
             opportunities = await find_arbitrage_opportunities_fast()
             
@@ -2591,7 +2854,146 @@ async def websocket_prices(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
 
-# Include router
+@api_router.post("/production/execute-triangular")
+async def execute_triangular_arb(request: AtomicExecutionRequest):
+    """
+    Execute triangular arbitrage (A → B → C → A).
+    Requires opportunity from /api/triangular-opportunities.
+    Each leg verified with actual post-swap balance before proceeding.
+    """
+    try:
+        # Look up opportunity from triangular scanner
+        opps = await find_triangular_arbitrage()
+        opportunity = None
+        for opp in opps:
+            if opp.get("id") == request.opportunity_id or str(opp.get("path_str", "")) == request.opportunity_id:
+                opportunity = opp
+                break
+
+        if not opportunity:
+            return {"success": False, "error": "Triangular opportunity not found or expired. Re-scan."}
+
+        # Staleness guard
+        opp_ts = opportunity.get("timestamp")
+        if opp_ts and (time.time() - float(opp_ts)) > 15:
+            return {"success": False, "error": "Opportunity stale (>15s). Re-scan first."}
+
+        # Fresh BERA price
+        try:
+            bera_price = await get_token_price_coingecko("berachain-bera")
+            if bera_price <= 0:
+                raise ValueError("zero")
+        except Exception:
+            bera_price = price_cache.get("bera_price", 5.0)
+
+        # Token approval for first leg
+        path = opportunity.get("path", [])
+        if path:
+            from core.constants import TOKENS as _TOKENS
+            first_sym = path[0]
+            first_tok = _TOKENS.get(first_sym)
+            if first_tok:
+                buy_dex     = opportunity.get("dexes", ["Kodiak V2"])[0]
+                buy_router  = KODIAK_V2_ROUTER if "Kodiak" in buy_dex else BEX_ROUTER
+                approval    = await token_approval_manager.ensure_approval(
+                    token_address=first_tok["address"],
+                    spender=buy_router,
+                    owner=request.wallet_address,
+                    required_amount=int(opportunity.get("amount_in", 0)),
+                    private_key=request.private_key
+                )
+                if not approval["success"]:
+                    return {"success": False, "error": f"Approval failed: {approval.get('error')}"}
+
+        result = await atomic_executor.execute_triangular_arbitrage(
+            opportunity=opportunity,
+            wallet_address=request.wallet_address,
+            private_key=request.private_key,
+            slippage_tolerance=request.slippage_tolerance,
+            use_private_rpc=request.use_private_rpc,
+            bera_price_usd=bera_price
+        )
+
+        if result["success"]:
+            await db.trades.insert_one({
+                "id": result["trade_id"],
+                "wallet_address": request.wallet_address.lower(),
+                "token_pair": "→".join(path),
+                "type": "triangular",
+                "expected_profit_usd": opportunity.get("net_profit_usd", 0),
+                "actual_profit_usd": result["actual_profit_usd"],
+                "gas_used": result["total_gas_used"],
+                "legs": result["legs"],
+                "status": "success",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Triangular execution error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@api_router.get("/production/best-opportunity")
+async def get_best_opportunity():
+    """
+    Return single best opportunity across all strategy types:
+    direct, triangular, multi-hop. Ranked by net_profit_usd.
+    Use this for manual or automated execution decisions.
+    """
+    try:
+        try:
+            bera_price = await get_token_price_coingecko("berachain-bera")
+            if bera_price <= 0:
+                raise ValueError("zero")
+        except Exception:
+            bera_price = price_cache.get("bera_price", 5.0)
+
+        gas_price = w3.eth.gas_price
+
+        # Gather all types in parallel
+        direct_task     = real_price_scanner.scan_arbitrage_opportunities(
+            gas_price_wei=gas_price, bera_price_usd=bera_price)
+        triangular_task = find_triangular_arbitrage()
+        multi_hop_task  = find_multi_hop_arbitrage()
+
+        direct_opps, tri_opps, mh_opps = await asyncio.gather(
+            direct_task, triangular_task, multi_hop_task,
+            return_exceptions=True
+        )
+
+        all_opps = []
+        if isinstance(direct_opps, list):
+            for o in direct_opps:
+                d = o if isinstance(o, dict) else o.model_dump()
+                d["strategy"] = "direct"
+                all_opps.append(d)
+        if isinstance(tri_opps, list):
+            for o in tri_opps:
+                o["strategy"] = "triangular"
+                all_opps.append(o)
+        if isinstance(mh_opps, list):
+            for o in mh_opps:
+                o["strategy"] = "multi_hop"
+                all_opps.append(o)
+
+        if not all_opps:
+            return {"found": False, "message": "No profitable opportunities right now"}
+
+        best = max(all_opps, key=lambda x: x.get("net_profit_usd", 0))
+        return {
+            "found": True,
+            "strategy": best.get("strategy", "unknown"),
+            "net_profit_usd": best.get("net_profit_usd", 0),
+            "opportunity": best
+        }
+
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+
+# ── Include router ─────────────────────────────────────────────────────────────
 app.include_router(api_router)
 
 # CORS Middleware

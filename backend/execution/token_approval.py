@@ -141,6 +141,20 @@ class TokenApprovalManager:
         
         return result
     
+    async def check_balance(self, token_address: str, owner: str) -> int:
+        """Check ERC20 token balance for owner"""
+        try:
+            token_contract = self.w3.eth.contract(
+                address=Web3.to_checksum_address(token_address),
+                abi=ERC20_ABI
+            )
+            return token_contract.functions.balanceOf(
+                Web3.to_checksum_address(owner)
+            ).call()
+        except Exception as e:
+            logger.error(f"Balance check failed: {e}")
+            return 0
+
     async def ensure_approval(
         self,
         token_address: str,
@@ -152,10 +166,25 @@ class TokenApprovalManager:
     ) -> Dict:
         """
         Check allowance and approve if insufficient.
+        Pre-flight balance check ensures sufficient funds before approving.
         Returns approval result or success if already approved.
         """
+        # Pre-flight: verify owner has sufficient balance
+        current_balance = await self.check_balance(token_address, owner)
+        if current_balance < required_amount:
+            logger.warning(
+                f"Insufficient balance: {current_balance} < {required_amount} for {token_address}"
+            )
+            return {
+                "success": False,
+                "already_approved": False,
+                "error": f"Insufficient balance: have {current_balance}, need {required_amount}",
+                "tx_hash": None,
+                "gas_used": 0
+            }
+
         current_allowance = await self.check_allowance(token_address, spender, owner)
-        
+
         if current_allowance >= required_amount:
             logger.info(f"Token already approved: {current_allowance} >= {required_amount}")
             return {
