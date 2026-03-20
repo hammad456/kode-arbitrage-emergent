@@ -543,8 +543,8 @@ class RealPriceScanner:
                     if spread_percent < MIN_SPREAD_THRESHOLD:
                         continue
                     
-                    # Calculate profits with real costs
-                    total_gas = 300000 * 2  # Two swaps
+                    # Calculate profits with real costs (250k per swap — consistent with executor)
+                    total_gas = 250000 * 2  # Two swaps
                     gas_cost_usd = (total_gas * gas_price_wei / 10**18) * bera_price_usd
                     
                     # Token price for USD conversion

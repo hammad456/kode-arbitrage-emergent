@@ -2854,7 +2854,146 @@ async def websocket_prices(websocket: WebSocket):
         logger.error(f"WebSocket error: {e}")
         manager.disconnect(websocket)
 
-# Include router
+@api_router.post("/production/execute-triangular")
+async def execute_triangular_arb(request: AtomicExecutionRequest):
+    """
+    Execute triangular arbitrage (A → B → C → A).
+    Requires opportunity from /api/triangular-opportunities.
+    Each leg verified with actual post-swap balance before proceeding.
+    """
+    try:
+        # Look up opportunity from triangular scanner
+        opps = await find_triangular_arbitrage()
+        opportunity = None
+        for opp in opps:
+            if opp.get("id") == request.opportunity_id or str(opp.get("path_str", "")) == request.opportunity_id:
+                opportunity = opp
+                break
+
+        if not opportunity:
+            return {"success": False, "error": "Triangular opportunity not found or expired. Re-scan."}
+
+        # Staleness guard
+        opp_ts = opportunity.get("timestamp")
+        if opp_ts and (time.time() - float(opp_ts)) > 15:
+            return {"success": False, "error": "Opportunity stale (>15s). Re-scan first."}
+
+        # Fresh BERA price
+        try:
+            bera_price = await get_token_price_coingecko("berachain-bera")
+            if bera_price <= 0:
+                raise ValueError("zero")
+        except Exception:
+            bera_price = price_cache.get("bera_price", 5.0)
+
+        # Token approval for first leg
+        path = opportunity.get("path", [])
+        if path:
+            from core.constants import TOKENS as _TOKENS
+            first_sym = path[0]
+            first_tok = _TOKENS.get(first_sym)
+            if first_tok:
+                buy_dex     = opportunity.get("dexes", ["Kodiak V2"])[0]
+                buy_router  = KODIAK_V2_ROUTER if "Kodiak" in buy_dex else BEX_ROUTER
+                approval    = await token_approval_manager.ensure_approval(
+                    token_address=first_tok["address"],
+                    spender=buy_router,
+                    owner=request.wallet_address,
+                    required_amount=int(opportunity.get("amount_in", 0)),
+                    private_key=request.private_key
+                )
+                if not approval["success"]:
+                    return {"success": False, "error": f"Approval failed: {approval.get('error')}"}
+
+        result = await atomic_executor.execute_triangular_arbitrage(
+            opportunity=opportunity,
+            wallet_address=request.wallet_address,
+            private_key=request.private_key,
+            slippage_tolerance=request.slippage_tolerance,
+            use_private_rpc=request.use_private_rpc,
+            bera_price_usd=bera_price
+        )
+
+        if result["success"]:
+            await db.trades.insert_one({
+                "id": result["trade_id"],
+                "wallet_address": request.wallet_address.lower(),
+                "token_pair": "→".join(path),
+                "type": "triangular",
+                "expected_profit_usd": opportunity.get("net_profit_usd", 0),
+                "actual_profit_usd": result["actual_profit_usd"],
+                "gas_used": result["total_gas_used"],
+                "legs": result["legs"],
+                "status": "success",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            })
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Triangular execution error: {e}")
+        return {"success": False, "error": str(e)}
+
+
+@api_router.get("/production/best-opportunity")
+async def get_best_opportunity():
+    """
+    Return single best opportunity across all strategy types:
+    direct, triangular, multi-hop. Ranked by net_profit_usd.
+    Use this for manual or automated execution decisions.
+    """
+    try:
+        try:
+            bera_price = await get_token_price_coingecko("berachain-bera")
+            if bera_price <= 0:
+                raise ValueError("zero")
+        except Exception:
+            bera_price = price_cache.get("bera_price", 5.0)
+
+        gas_price = w3.eth.gas_price
+
+        # Gather all types in parallel
+        direct_task     = real_price_scanner.scan_arbitrage_opportunities(
+            gas_price_wei=gas_price, bera_price_usd=bera_price)
+        triangular_task = find_triangular_arbitrage()
+        multi_hop_task  = find_multi_hop_arbitrage()
+
+        direct_opps, tri_opps, mh_opps = await asyncio.gather(
+            direct_task, triangular_task, multi_hop_task,
+            return_exceptions=True
+        )
+
+        all_opps = []
+        if isinstance(direct_opps, list):
+            for o in direct_opps:
+                d = o if isinstance(o, dict) else o.model_dump()
+                d["strategy"] = "direct"
+                all_opps.append(d)
+        if isinstance(tri_opps, list):
+            for o in tri_opps:
+                o["strategy"] = "triangular"
+                all_opps.append(o)
+        if isinstance(mh_opps, list):
+            for o in mh_opps:
+                o["strategy"] = "multi_hop"
+                all_opps.append(o)
+
+        if not all_opps:
+            return {"found": False, "message": "No profitable opportunities right now"}
+
+        best = max(all_opps, key=lambda x: x.get("net_profit_usd", 0))
+        return {
+            "found": True,
+            "strategy": best.get("strategy", "unknown"),
+            "net_profit_usd": best.get("net_profit_usd", 0),
+            "opportunity": best
+        }
+
+    except Exception as e:
+        return {"found": False, "error": str(e)}
+
+
+# ── Include router ─────────────────────────────────────────────────────────────
 app.include_router(api_router)
 
 # CORS Middleware
