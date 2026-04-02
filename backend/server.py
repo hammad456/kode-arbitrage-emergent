@@ -33,6 +33,7 @@ from execution.token_approval import TokenApprovalManager
 from execution.atomic_executor import AtomicArbExecutor, TradeLogger
 from execution.flash_loan import FlashLoanExecutor
 from scanner.multicall_scanner import RealPriceScanner
+from monitor.ai_monitor import start_monitor, get_monitor_status, portfolio as monitor_portfolio
 
 # MongoDB connection - fallback to mongomock if real MongoDB unavailable
 mongo_url = os.environ.get('MONGO_URL', 'mongodb://localhost:27017')
@@ -500,6 +501,10 @@ class AutoExecutionEngine:
         if time.time() - self.last_execution < self.cooldown:
             return False
         if opportunity.get("net_profit_usd", 0) < self.min_profit:
+            return False
+        # Honor HYDRA circuit breaker — stop trading if risk limits exceeded
+        if monitor_portfolio.check_and_maybe_release():
+            logger.warning("AutoExecutionEngine blocked: HYDRA circuit breaker active")
             return False
         return True
 
@@ -1988,6 +1993,15 @@ async def health_check():
     except Exception as e:
         return {"status": "degraded", "error": str(e)}
 
+
+@api_router.get("/monitor/status")
+async def monitor_status():
+    """
+    HYDRA AI Monitor status: portfolio PnL, circuit breaker, RPC cluster health,
+    and latest AI audit output.
+    """
+    return get_monitor_status()
+
 @api_router.get("/tokens", response_model=List[TokenInfo])
 async def get_tokens():
     return [TokenInfo(address=t["address"], symbol=t["symbol"], decimals=t["decimals"]) for t in TOKENS.values()]
@@ -3248,6 +3262,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def startup_monitor():
+    """Launch HYDRA AI monitor background loops at server startup."""
+    asyncio.create_task(start_monitor())
+
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
